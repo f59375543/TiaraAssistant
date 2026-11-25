@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>蒂亚拉小助手 v2026.11.24</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+<header class="bar"><div class="bar-inner"><b class="brand">蒂亚拉小助手 <small>v2026.11.24</small></b>
+  <nav class="nav" aria-label="主导航">
+    <button class="active" data-tab="tasks">任务</button><button data-tab="logs">日志</button>
+    <button data-tab="emulator">设置</button><button data-tab="capture">画面与模板</button><button data-tab="notifications">通知</button>
+  </nav></div></header>
+<div class="workspace"><main>
+    <div id="attention-alert" class="attention-alert" role="alert" hidden></div>
+    <section class="section" id="emulator">
+      <div class="card"><h2>运行设置</h2><div class="grid3">
+        <label>任务日刷新时间<input id="daily-reset-at" type="time"></label>
+        <label>识图超时（秒）<input id="image-timeout" type="number" min="0" max="300"></label>
+        <label class="check"><input id="stop-on-error" type="checkbox">失败后停止</label>
+        <label class="check"><input id="close-tool-after-run" type="checkbox">运行结束后关闭工具</label></div></div>
+      <div class="card"><h2>ADB 与模拟器</h2><div class="grid2">
+        <label>ADB 程序路径<input id="adb-path" placeholder="builtin（内置）或 adb.exe 完整路径"></label><label>设备地址 / 序列号<input id="serial" placeholder="auto（自动）或实际设备地址"></label>
+        <label>模拟器程序路径（可选）<input id="emulator-path" placeholder="例如 C:\...\dnplayer.exe"></label><label>游戏包名<input id="package" placeholder="com.miHoYo.HSoDv2Original"></label>
+        <label>启动参数（每行一个）<textarea id="emulator-args" rows="3"></textarea></label><label>模拟器启动等待秒数<input id="launch-delay" type="number" min="0" max="300" step="1"></label>
+        <label class="check"><input id="stop-emulator" type="checkbox">运行结束后关闭本工具启动的模拟器</label>
+      </div><div class="rule"></div><div class="actions"><button id="doctor">检测连接</button></div><p id="doctor-result" class="hint"></p></div>
+    </section>
+    <section class="section active" id="tasks">
+      <div class="heading"><div><h1>任务</h1><p id="daily-plan" class="sub">正在读取执行记录…</p></div><div class="actions"><button id="undo-delete" hidden>撤销删除</button><button id="add-task">添加任务</button></div></div>
+      <div class="task-layout">
+        <div class="card task-table"><div class="column-titles"><span>启用</span><span>任务顺序</span><span>执行频率</span><span></span></div><div id="task-list" class="task-list"></div></div>
+        <div id="task-editor" class="editor"><h2 id="editor-title">任务设置</h2>
+          <div class="actions"><button id="move-up">上移</button><button id="move-down">下移</button></div>
+          <details><summary>名称、类型与日期</summary><div class="fieldrow"><label>名称<input id="task-name"></label><label>任务 ID<input id="task-id"></label></div>
+          <label>类型<select id="task-kind"><option value="daily">日常</option><option value="event">节日活动</option><option value="birthday">角色生日</option><option value="custom">自定义</option></select></label>
+          <label>执行日期规则（JSON）<textarea id="task-schedule" spellcheck="false"></textarea></label>
+          <p class="hint">daily 匹配每天，weekdays 的 days 取 0–6（周一至周日），dates 可用 MM-DD，range 使用起止日期。</p></details>
+          <h3>步骤列表</h3><div id="step-list" class="task-list"></div><div class="row"><select id="new-step-type"><option value="game_flow">游戏流程</option><option value="tap_image">点击图像</option><option value="wait_image">等待图像</option><option value="tap">点击坐标</option><option value="sleep">等待秒数</option><option value="key">返回键</option><option value="launch_game">启动游戏</option><option value="screenshot">保存截图</option><option value="repeat">重复领取</option><option value="if_image">图像条件</option></select><select id="new-game-flow" style="flex:1"><option value="enter_game">进入上次服务器</option><option value="refresh_resonance">共鸣屋免费刷新</option><option value="free_gift">零时馈礼</option><option value="quick_battle:使魔的爱">使魔的爱快捷战斗</option><option value="quick_battle:虚轴之庭">虚轴之庭快捷战斗</option><option value="stamina_farm">体力本刷取</option><option value="expeditions">使魔探险领取与派遣</option><option value="claim_presence">存在感奖励</option><option value="claim_weekly">每周奖励</option><option value="bonus_double_stamina">双倍体力额外 BONUS</option></select><input id="new-step-image" list="template-options" placeholder="模板名或数值" style="flex:1" hidden><datalist id="template-options"></datalist><button id="add-step">添加步骤</button></div><div id="flow-options"></div><details><summary>编辑步骤 JSON</summary><label>步骤（JSON 数组）<textarea id="task-steps" class="steps" spellcheck="false"></textarea></label><p class="hint">可组合游戏流程、图像识别、坐标点击等步骤；缺图可设 on_missing 为 fail、continue、skip_task、break_repeat。</p></details><div class="actions"><button id="test-task">仅测试此任务</button></div></div></div>
+    </section>
+    <section class="section" id="capture">
+      <div class="card"><h2>截图与模板</h2><p class="hint">“裁剪模板”模式下拖动框选按钮，保存 PNG；“手动点击”模式下点画面可操作模拟器。请截取有辨识度的按钮区域，避开动态数字。</p><div class="actions"><button id="refresh-screen" class="primary">获取模拟器截图</button><label class="check"><input type="radio" name="screen-mode" value="crop" checked>裁剪模板</label><label class="check"><input type="radio" name="screen-mode" value="tap">手动点击</label><label class="check"><input id="record-tap" type="checkbox">记录点击到当前任务</label></div><div class="screen-wrap" style="margin-top:14px"><div id="screen-placeholder" class="screen-placeholder">点击“获取模拟器截图”</div><canvas id="screen" hidden></canvas></div><p id="selection-info" class="hint">尚未框选区域</p><div class="actions"><input id="template-name" placeholder="例如 home.png"><button id="save-template">保存模板</button></div><div class="rule"></div><h3>已有模板</h3><div id="template-list" class="template-list"></div></div>
+    </section>
+    <section class="section" id="notifications">
+      <div class="card"><h2>发送时机</h2><div class="actions"><label class="check"><input id="notify-success" type="checkbox">任务完成时通知</label><label class="check"><input id="notify-error" type="checkbox">任务失败时通知</label></div></div>
+      <div class="card"><h2>邮件通知</h2><div class="grid2"><label class="check"><input id="email-enabled" type="checkbox">启用邮件通知</label><label>邮箱<select id="email-provider"><option value="qq">QQ 邮箱（发给自己）</option><option value="smtp">其他 SMTP 邮箱</option></select></label></div><div id="qq-email-fields" class="grid2" style="margin-top:14px"><label>QQ 号<input id="qq-number" inputmode="numeric" autocomplete="off"></label><label>SMTP 授权码<input id="smtp-auth-code" type="password" autocomplete="new-password"></label></div><div id="custom-email-fields" class="grid2" style="margin-top:14px" hidden><label>SMTP 主机<input id="smtp-host"></label><label>端口<input id="smtp-port" type="number"></label><label>登录用户名<input id="smtp-user"></label><label>发件地址<input id="smtp-sender"></label><label>收件地址<input id="smtp-recipient"></label><label>密码环境变量名<input id="smtp-env"></label><label>安全连接<select id="smtp-security"><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option></select></label></div><div class="actions" style="margin-top:16px"><button id="test-email">发送测试邮件</button></div></div>
+      <div class="card"><h2>HTTP Webhook</h2><p class="hint">发送 JSON：title、content、success。每行一个 URL。</p><label>Webhook 地址<textarea id="webhooks" rows="4" placeholder="https://..." spellcheck="false"></textarea></label></div>
+    </section>
+    <section class="section" id="logs"><div class="card"><h1>运行日志</h1><div id="full-log" class="log">尚无日志</div>
+      <details id="result-details" hidden><summary>本次运行结果</summary><pre id="result-json" class="log"></pre></details></div></section>
+  </main></div>
+<footer><div class="footer-inner"><span id="run-badge" class="badge" role="status">载入中</span>
+  <div class="actions"><button id="reset-today" disabled>重置今日执行记录</button><button id="save-top" disabled>保存</button>
+    <button id="stop-top" class="danger" disabled>停止</button><button id="run-top" class="primary" disabled>运行</button></div></div></footer>
+<dialog id="task-picker" aria-labelledby="picker-title"><div class="heading"><h2 id="picker-title">添加任务</h2><button id="close-picker">关闭</button></div>
+  <h3>内置任务</h3><div id="preset-list"></div>
+  <h3>自定义任务</h3><form id="custom-form" class="actions"><label>名称<input id="custom-name" placeholder="新任务名称" required></label><button id="create-custom">创建</button></form>
+</dialog>
+<dialog id="confirm-dialog"><p id="confirm-message"></p><form method="dialog" class="actions">
+  <button value="cancel" autofocus>取消</button><button value="ok">确认</button></form></dialog>
+<div id="toast" class="toast" role="status"></div>
+<script src="/ui/app.js"></script>
+</body>
+</html>

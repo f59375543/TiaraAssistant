@@ -1,0 +1,22 @@
+# 运行时与第三方依赖（可重建，不进版本库）
+/runtime/
+/platform-tools/
+/data/
+/logs/
+/.daily-attempts/
+
+# 用户配置与运行状态
+/config.json
+/state.json
+*.lock
+
+# 构建产物与缓存
+/蒂亚拉小助手.exe
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统文件
+Thumbs.db
+.DS_Store
+desktop.ini
