@@ -16,7 +16,7 @@ from PIL import Image, ImageChops, ImageStat
 from .ocr import TextHit, double_stamina, find_text, integer_after, read_stamina_hud, read_text, stage_labels, stamina
 from .adb import AdbError, AdbTransportError
 from .runner import SkipTask
-from .vision import find_image
+from .vision import ImageFrame, find_image
 from .inventory import check_equipment_capacity
 from .combat import weapon_controls
 
@@ -131,9 +131,13 @@ class GameFlows:
         self.log("已确认战斗结算，返回关卡地图")
         return True
 
-    def _dismiss_navigation_notice(self, hits: list[TextHit]) -> bool:
+    @staticmethod
+    def _reward_receipt(hits: list[TextHit]) -> bool:
         rewards = find_text(hits, "已领取以下奖励")
-        if rewards and rewards.y < 150:
+        return rewards is not None and rewards.y < 150
+
+    def _dismiss_navigation_notice(self, hits: list[TextHit]) -> bool:
+        if self._reward_receipt(hits):
             self.log("关闭已领取奖励展示")
             self._tap(1450, 740, 1.0)
             return True
@@ -150,13 +154,13 @@ class GameFlows:
                 return True
         return False
 
-    def _dismiss_navigation_card(self, screenshot: bytes | None = None) -> bool:
-        if screenshot is None:
-            screenshot = self._screen()
+    def _dismiss_navigation_card(self, frame: ImageFrame | None = None) -> bool:
+        if frame is None:
+            frame = ImageFrame(self._screen())
         for image, region, label in (
                 ("navigation_close.png", [0.65, 0.08, 0.95, 0.5], "活动宣传卡片"),
                 ("navigation_announcement_close.png", [0.8, 0, 1, 0.25], "游戏公告")):
-            close = find_image(screenshot, Path(__file__).parent / "assets", {
+            close = find_image(frame, Path(__file__).parent / "assets", {
                 "image": image, "region": region, "threshold": 0.94})
             if close:
                 self.log(f"关闭遮挡导航的{label}")
@@ -175,13 +179,14 @@ class GameFlows:
                     token in words for token in ("水晶", "钻石", "双倍体力", "将消耗")):
                 self._cancel_exchange(modal, "返回首页前关闭体力兑换提示")
                 continue
+            frame = ImageFrame(screenshot)
             if (self._dismiss_combat_result(hits) or self._dismiss_navigation_notice(hits)
-                    or self._dismiss_navigation_card(screenshot)):
+                    or self._dismiss_navigation_card(frame)):
                 continue
             hit = next((hit for hit in hits if "首页" in hit.text and
                         750 <= hit.x <= 890 and 70 <= hit.y < 130), None)
             if hit:
-                active = find_image(screenshot, Path(__file__).parent / "assets", {
+                active = find_image(frame, Path(__file__).parent / "assets", {
                     "image": "home_active.png", "region": [0.47, 0, 0.56, 0.15], "threshold": 0.94})
                 # The task panel also highlights Home. A click must first
                 # return to the character screen before callers open its menu.
@@ -193,7 +198,7 @@ class GameFlows:
                 continue
             # Full-screen chapters replace the top menu with a house icon.
             # It returns to the battle picker; then use its normal Home tab.
-            home = find_image(screenshot, Path(__file__).parent / "assets", {
+            home = find_image(frame, Path(__file__).parent / "assets", {
                 "image": "navigation_home.png", "region": [0.075, 0.015, 0.16, 0.13],
                 "threshold": 0.94})
             if home:
@@ -305,28 +310,38 @@ class GameFlows:
     def claim_login_rewards(self, options: dict[str, Any]) -> dict[str, Any]:
         claimed: list[str] = []
         pending = None
-        idle = 0
+        home_frames = 0
+        next_reward_page = None
         waiting = 0
         birthday_actions: set[str] = set()
         for _ in range(40):
             self._check_cancel()
-            hits = self._hits()
+            screenshot = self._screen()
+            hits = self._hits(frame=screenshot)
             if self._dismiss_navigation_notice(hits):
-                if pending:
+                if pending and self._reward_receipt(hits):
                     claimed.append(pending)
                     self.log(f"已确认领取：{pending}")
                     pending = None
-                idle = 0
+                home_frames = 0
+                next_reward_page = None
                 continue
             birthday_stage = self._birthday_reward_stage(hits)
             page = "角色生日奖励" if birthday_stage else self._login_reward_page(hits)
-            if pending and page != pending:
+            if pending and page is not None and page != pending:
+                if next_reward_page != page:
+                    next_reward_page = page
+                    home_frames = 0
+                    self.sleep(0.6)
+                    continue
                 claimed.append(pending)
                 self.log(f"已确认领取：{pending}")
                 pending = None
                 waiting = 0
+            next_reward_page = None
+            if page is not None:
+                home_frames = 0
             if birthday_stage:
-                idle = 0
                 if birthday_stage in birthday_actions or page in claimed:
                     waiting += 1
                     if waiting >= 8:
@@ -352,7 +367,6 @@ class GameFlows:
                 waiting = 0
                 continue
             if page is not None:
-                idle = 0
                 if pending or page in claimed:
                     waiting += 1
                     if waiting >= 8:
@@ -373,14 +387,24 @@ class GameFlows:
                         raise RuntimeError(f"已识别{page}，但未确认领取按钮")
                     self.sleep(0.6)
                 continue
-            idle += 1
-            if idle >= 3:
+            top = [h for h in hits if 70 <= h.y < 130]
+            home_tab = any(h.text.strip() == "首页" and 750 <= h.x <= 890 for h in top)
+            home_visible = home_tab and find_text(top, "战斗") and find_image(
+                screenshot, Path(__file__).parent / "assets",
+                {"image": "home_active.png", "region": [0.47, 0, 0.56, 0.15], "threshold": 0.94})
+            home_frames = home_frames + 1 if home_visible else 0
+            if home_frames >= 3:
                 if "wish" in birthday_actions and "claim" not in birthday_actions:
                     raise RuntimeError("已送上生日祝福，但未确认生日奖励领取弹窗")
+                if pending:
+                    claimed.append(pending)
+                    self.log(f"已确认领取：{pending}")
                 self.log(f"签到、连登与角色生日奖励处理完成，共领取 {len(claimed)} 份")
                 return {"claimed": len(claimed), "pages": claimed}
             self.sleep(0.6)
-        raise RuntimeError("每日登录奖励处理超过检查上限")
+        if pending:
+            raise RuntimeError(f"已提交{pending}领取，但未确认领取结果")
+        raise RuntimeError("每日登录奖励处理超过检查上限，未确认返回首页")
 
     @staticmethod
     def _mailbox_page(hits: list[TextHit]) -> bool:
@@ -620,18 +644,19 @@ class GameFlows:
             if self._picker_tabs_visible(tabs):
                 return
             hits = [hit for hit in full if hit.score >= 0.75]
-            if self._dismiss_navigation_notice(hits) or self._dismiss_navigation_card(screenshot):
+            frame = ImageFrame(screenshot)
+            if self._dismiss_navigation_notice(hits) or self._dismiss_navigation_card(frame):
                 continue
             reset = None
             for image in ("battle_reset.png", "battle_reset_compact.png"):
-                reset = find_image(screenshot, Path(__file__).parent / "assets", {
+                reset = find_image(frame, Path(__file__).parent / "assets", {
                     "image": image, "region": [0.8, 0.16, 1, 0.28], "threshold": 0.94})
                 if reset:
                     break
             if reset:
                 self._tap(reset[0], reset[1], 0.8)
                 continue
-            home = find_image(screenshot, Path(__file__).parent / "assets", {
+            home = find_image(frame, Path(__file__).parent / "assets", {
                 "image": "home_active.png", "region": [0.47, 0, 0.56, 0.15], "threshold": 0.94})
             if home and home_retries < 3:
                 battle = find_text(self._read_region(screenshot, (900, 0, 1020, 135), 0.75), "战斗")
@@ -730,31 +755,45 @@ class GameFlows:
 
     def _execute_quick(self, stage: str, allowance: int) -> int:
         self._click("快捷战斗", (1040, 740, 1440, 870))
-        previous_count = None
-        for _ in range(3):
-            dialog = self._hits((600, 300, 1010, 620))
+        expected_count = None
+        missing_button_frames = 0
+        while missing_button_frames < 4:
+            dialog = self._hits((600, 300, 1010, 640))
             if not find_text(dialog, "快速战斗") and not find_text(dialog, "快捷战斗"):
                 raise RuntimeError("无法核对快捷战斗确认框")
             counts = [int(hit.text) for hit in dialog if 465 <= hit.y <= 515 and
                       670 <= hit.x <= 810 and re.fullmatch(r"\d{1,2}", hit.text)]
             if len(counts) != 1 or not 1 <= counts[0] <= 3:
                 raise RuntimeError("无法识别快捷战斗场数，未确认")
-            if previous_count is not None and counts[0] != previous_count - 1:
+            count = counts[0]
+            if expected_count is not None and count != expected_count:
                 raise RuntimeError("快捷战斗场数调整未生效，未确认")
-            if counts[0] <= allowance:
+            if count > allowance:
+                if count == 1:
+                    raise RuntimeError("快捷战斗次数超出免费次数，未确认")
+                expected_count = count - 1
+                self._tap(641, 492)
+                continue
+            values = [int(hit.text) for hit in sorted(dialog, key=lambda hit: hit.x)
+                      if 385 <= hit.y <= 455 and re.fullmatch(r"\d{1,4}", hit.text)]
+            if len(values) != 2:
+                raise RuntimeError("无法确认快捷战斗体力变化，未确认")
+            expected_cost = count * 30 if stage == "使魔的爱" else 0
+            if values[0] < expected_cost or values[0] - values[1] != expected_cost:
+                raise RuntimeError("快捷战斗体力消耗与预期不符，未确认")
+            buttons = [hit for hit in dialog if hit.text.strip() == "确定" and
+                       600 <= hit.x < 800 and 535 <= hit.y < 640]
+            if len(buttons) > 1:
+                raise RuntimeError("快捷战斗确认按钮不唯一，未确认")
+            if buttons:
+                button = buttons[0]
+                self._tap(button.x + button.width // 2, button.y + button.height // 2)
                 break
-            previous_count = counts[0]
-            self._tap(641, 492)
+            expected_count = count
+            missing_button_frames += 1
+            self.sleep(0.6)
         else:
-            raise RuntimeError("快捷战斗次数超出免费次数，未确认")
-        values = [int(hit.text) for hit in sorted(dialog, key=lambda hit: hit.x)
-                  if 385 <= hit.y <= 455 and re.fullmatch(r"\d{1,4}", hit.text)]
-        if len(values) != 2 or len(counts) != 1 or not 1 <= counts[0] <= allowance:
-            raise RuntimeError("无法确认快捷战斗次数与体力变化，未确认")
-        expected_cost = counts[0] * 30 if stage == "使魔的爱" else 0
-        if values[0] < expected_cost or values[0] - values[1] != expected_cost:
-            raise RuntimeError("快捷战斗体力消耗与预期不符，未确认")
-        self._click("确定", (600, 535, 800, 640))
+            raise RuntimeError("未找到快捷战斗确认按钮，未确认")
         for _ in range(12):
             self.sleep(0.6)
             # Detect the settlement and its confirmation on the same full frame.
@@ -762,7 +801,7 @@ class GameFlows:
             confirm = self._combat_result_confirmation(self._hits())
             if confirm:
                 self._tap(confirm.x + confirm.width // 2, confirm.y + confirm.height // 2)
-                return counts[0]
+                return count
         raise RuntimeError("快捷战斗后未识别到结算")
 
     def _quick_allowance(self, stage: str, *, allow_zero: bool = False) -> int:

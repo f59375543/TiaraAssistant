@@ -10,7 +10,7 @@ from pathlib import Path
 from .adb import AdbDevice
 from .config import ConfigError, load_config, save_config
 from .defaults import DEFAULT_CONFIG
-from .runner import TaskRunner
+from .runner import RunBusyError, TaskRunner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,7 +83,10 @@ def main(argv: list[str] | None = None) -> int:
                 while (target - datetime.now()).total_seconds() > 0:
                     time.sleep(min(30, max(0.1, (target - datetime.now()).total_seconds())))
                 config = load_config(path)
-                TaskRunner(config, path).run()
+                try:
+                    TaskRunner(config, path).run()
+                except RunBusyError as exc:
+                    print(f"{target:%Y-%m-%d %H:%M} 已跳过本次定时任务：{exc}", flush=True)
         if args.command == "serve":
             from .web import serve as web_serve
             web_serve(path, args.port)

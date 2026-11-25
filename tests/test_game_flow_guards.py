@@ -91,5 +91,78 @@ class BattlePickerTests(unittest.TestCase):
                 self.assertTrue(all(c.args[0] == b"picker" for c in ocr.call_args_list))
 
 
+class LoginRewardTests(unittest.TestCase):
+    def page(self, name):
+        return [hit(name, 600, 270), hit("第一天", 410, 450), hit("第二天", 530, 450),
+                hit("领取", 1100, 625)]
+
+    def flow(self, frames):
+        runner = Mock()
+        runner.cancel.is_set.return_value = False
+        flow = GameFlows(runner)
+        flow._screen = Mock(return_value=b"screen")
+        flow._hits = Mock(side_effect=frames)
+        flow._tap = Mock()
+        return flow
+
+    def test_unknown_frames_and_unrelated_notice_do_not_confirm(self):
+        notice = [hit("提示 未领取 活动奖励 背包"), hit("确定", 705, 570)]
+        flow = self.flow([self.page("每日签到"), notice] + [[]] * 38)
+        with self.assertRaisesRegex(RuntimeError, "未确认领取结果"):
+            flow.claim_login_rewards({})
+        self.assertEqual(flow._tap.call_count, 2)
+        self.assertFalse(any("已确认领取" in str(entry) for entry in flow.log.call_args_list))
+
+    def test_confirms_next_reward_page_and_waits_for_stable_home(self):
+        second = self.page("连续登录")
+        home = [hit("首页", 790, 80), hit("战斗", 945, 80)]
+        flow = self.flow([self.page("每日签到"), [], second, [], second, second,
+                          home, [], home, home, home])
+        with patch("hka.game_flows.find_image", return_value=(810, 85, 1.0)):
+            self.assertEqual(flow.claim_login_rewards({}), {"claimed": 2, "pages": ["每日签到", "连续登录"]})
+        self.assertEqual(flow._tap.call_count, 2)
+        self.assertEqual(flow._screen.call_count, 11)
+
+    def test_receipt_closes_before_return_home(self):
+        home = [hit("首页", 790, 80), hit("战斗", 945, 80)]
+        flow = self.flow([self.page("每日签到"), [hit("已领取以下奖励", 700, 60)], *[home] * 3])
+        with patch("hka.game_flows.find_image", return_value=(810, 85, 1.0)):
+            self.assertEqual(flow.claim_login_rewards({})["claimed"], 1)
+        self.assertEqual(flow._tap.call_args_list, [call(1110, 635, 1), call(1450, 740, 1.0)])
+
+
+class QuickBattleTests(unittest.TestCase):
+    def dialog(self, count, after, buttons=()):
+        return [hit("快捷战斗", 700, 340), hit("100", 710, 420), hit(str(after), 810, 420),
+                hit(str(count), 730, 485), *buttons]
+
+    def flow(self, frames):
+        flow = GameFlows(Mock())
+        flow._hits = Mock(side_effect=frames)
+        flow._click = Mock()
+        flow._tap = Mock()
+        return flow
+
+    def test_rechecks_all_values_before_accepting_late_button(self):
+        button = hit("确定", 680, 560)
+        for changed in ([button], self.dialog(1, 40, [button]),
+                        self.dialog(1, 70, [button, hit("确定", 755, 560)])):
+            with self.subTest(changed=changed):
+                flow = self.flow([self.dialog(1, 70), changed])
+                with self.assertRaises(RuntimeError):
+                    flow._execute_quick("使魔的爱", 1)
+                flow._tap.assert_not_called()
+
+    def test_adjust_count_then_confirm_and_settle(self):
+        button = hit("确定", 680, 560)
+        result = [hit("战斗结算", 780, 160), hit("确定", 850, 760)]
+        flow = self.flow([self.dialog(3, 10), self.dialog(2, 40), self.dialog(1, 70),
+                          self.dialog(1, 70, [button]), result])
+        self.assertEqual(flow._execute_quick("使魔的爱", 1), 1)
+        flow._click.assert_called_once_with("快捷战斗", (1040, 740, 1440, 870))
+        self.assertEqual(flow._tap.call_args_list, [call(641, 492), call(641, 492),
+                                                   call(690, 570), call(860, 770)])
+
+
 if __name__ == "__main__":
     unittest.main()

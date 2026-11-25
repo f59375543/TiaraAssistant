@@ -1,4 +1,4 @@
-let config=null, dailyPlan=null, selected=0, screenImage=null, selection=null, dragStart=null, runStatus=null;
+let config=null, dailyPlan=null, selected=0, dirty=false, screenImage=null, selection=null, dragStart=null, runStatus=null;
 const $=id=>document.getElementById(id);
 async function api(path,method='GET',data){const response=await fetch('/api/'+path,{method,headers:method==='GET'?{}:{'Content-Type':'application/json'},body:method==='GET'?undefined:JSON.stringify(data||{})});const result=await response.json();if(!response.ok)throw new Error(result.error||'请求失败');return result}
 function toast(message,error=false){const box=$('toast');box.textContent=message;box.className='toast'+(error?' error':'');box.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>box.style.display='none',4500)}
@@ -7,9 +7,15 @@ function tab(name){
   const section=$(name);
   if(!section?.classList.contains('section'))return;
   document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x===section));
-  document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
+  document.querySelectorAll('.nav button').forEach(button=>{
+    const current=button.dataset.tab===name;
+    button.classList.toggle('active',current);
+    if(current)button.setAttribute('aria-current','page');
+    else button.removeAttribute('aria-current');
+  });
   document.querySelector('.workspace').scrollTop=0;
   history.replaceState(null,'','#'+name);
+  $('stop-top').hidden=!runStatus?.running||name==='tasks';
 }
 function confirmAction(message){
   const dialog=$('confirm-dialog');
@@ -20,7 +26,9 @@ function confirmAction(message){
     dialog.showModal();
   });
 }
-document.querySelectorAll('.nav button').forEach(button=>button.onclick=()=>tab(button.dataset.tab));
+document.querySelectorAll('[data-tab],[data-go]').forEach(button=>{
+  button.onclick=()=>tab(button.dataset.tab||button.dataset.go);
+});
 if(location.hash)tab(location.hash.slice(1));
 function loadFields(){const e=config.emulator,r=config.runtime||{},n=config.notifications||{},m=n.email||{};
   $('close-tool-after-run').checked = r.close_tool_after_run === true;
@@ -43,7 +51,7 @@ function renderTasks(fill=true){
     enabled.type='checkbox';
     enabled.checked=task.enabled;
     enabled.setAttribute('aria-label','启用 '+task.name);
-    enabled.onchange=()=>{task.enabled=enabled.checked;showPlanSummary()};
+    enabled.onchange=()=>{task.enabled=enabled.checked;markDirty();showPlanSummary()};
     const edit=document.createElement('button');
     edit.className='task-item';
     edit.append((index+1)+'. '+task.name);
@@ -64,7 +72,7 @@ function renderTasks(fill=true){
     freq.add(new Option('每天只执行一次','once_per_day'));
     freq.add(new Option('每次运行都执行','every_run'));
     freq.value=task.frequency||'once_per_day';
-    freq.onchange=()=>{task.frequency=freq.value};
+    freq.onchange=()=>{task.frequency=freq.value;markDirty()};
     const remove=document.createElement('button');
     remove.className='remove-task';
     remove.textContent='删除';
@@ -97,7 +105,7 @@ function fillTask(){
   renderStepList();
 }
 function readSteps(){const steps=JSON.parse($('task-steps').value);if(!Array.isArray(steps))throw new Error('步骤必须是 JSON 数组');return steps}
-function setSteps(steps){$('task-steps').value=JSON.stringify(steps,null,2);renderStepList()}
+function setSteps(steps){markDirty();$('task-steps').value=JSON.stringify(steps,null,2);renderStepList()}
 const flowNames={claim_guild_daily:'领取社团每日奖励',claim_mail:'领取邮件附件',enter_game:'进入上次服务器',refresh_resonance:'共鸣屋免费刷新',free_gift:'零时馈礼',quick_battle:'快捷战斗',stamina_farm:'体力本刷取',expeditions:'使魔探险',claim_presence:'存在感奖励',claim_weekly:'每周奖励',bonus_double_stamina:'双倍体力额外 BONUS'};
 function stepLabel(step){const names={launch_game:'启动游戏',wait_image:'等待图像',tap_image:'点击图像',tap:'点击坐标',swipe:'滑动',key:'按键',sleep:'等待',screenshot:'截图',repeat:'重复',if_image:'条件',game_flow:'游戏流程'};return (names[step.type]||step.type)+' · '+((step.flow?(flowNames[step.flow]||step.flow)+(step.options?.stage?' · '+step.options.stage:''):'')||step.image||step.name||((step.x!==undefined)?step.x+','+step.y:'')||(step.seconds!==undefined?step.seconds+' 秒':'')||(step.times!==undefined?step.times+' 次':''))}
 function renderStepList(){let steps;try{steps=readSteps()}catch(e){$('step-list').textContent='JSON 格式错误，无法显示步骤';return}const list=$('step-list');list.textContent='';steps.forEach((step,i)=>{const row=document.createElement('div');row.className='row';row.style.cssText='border:1px solid var(--line);border-radius:8px;padding:6px 9px';const label=document.createElement('span');label.textContent=(i+1)+'. '+stepLabel(step);label.style.flex='1';row.append(label);[['↑',-1],['↓',1],['×',0]].forEach(([text,delta])=>{const button=document.createElement('button');button.textContent=text;button.style.padding='3px 8px';button.onclick=()=>{try{const items=readSteps();if(delta===0)items.splice(i,1);else{const target=i+delta;if(target<0||target>=items.length)return;[items[i],items[target]]=[items[target],items[i]]}setSteps(items)}catch(e){toast(e.message,true)}};row.append(button)});list.append(row)});if(!steps.length)list.textContent='暂无步骤';renderFlowOptions()}
@@ -153,15 +161,113 @@ $('new-game-flow').add(new Option('领取邮件附件','claim_mail'),2);
 $('new-game-flow').add(new Option('领取社团每日奖励','claim_guild_daily'),3);
 $('new-step-type').onchange=()=>{const game=$('new-step-type').value==='game_flow';$('new-game-flow').hidden=!game;$('new-step-image').hidden=game};
 function addStep(){const kind=$('new-step-type').value,value=kind==='game_flow'?$('new-game-flow').value:$('new-step-image').value.trim();let step;if(['tap_image','wait_image','if_image','repeat','game_flow'].includes(kind)&&!value)throw new Error('请填写流程或模板名');if(kind==='game_flow'){const [flow,stage]=value.split(':');step={type:kind,flow,options:stage?{stage}:{}}}else if(kind==='tap_image')step={type:kind,image:value,timeout:8,wait:1};else if(kind==='wait_image')step={type:kind,image:value,timeout:20};else if(kind==='if_image')step={type:kind,image:value,then:[],else:[]};else if(kind==='repeat')step={type:kind,times:10,steps:[{type:'tap_image',image:value,timeout:2,on_missing:'break_repeat',wait:1}]};else if(kind==='tap'){const parts=value.split(',').map(Number);if(parts.length!==2||parts.some(x=>!Number.isFinite(x)||x<0||x>1))throw new Error('坐标请输入 0 到 1 之间的 x,y');step={type:kind,x:parts[0],y:parts[1]}}else if(kind==='sleep'){const seconds=Number(value);if(!Number.isFinite(seconds)||seconds<0||seconds>3600)throw new Error('请输入 0 到 3600 秒');step={type:kind,seconds}}else if(kind==='key')step={type:kind,code:4};else if(kind==='launch_game')step={type:kind,wait:20};else step={type:'screenshot',name:'manual'};const steps=readSteps();steps.push(step);setSteps(steps);$('new-step-image').value=''}
+const planLabels={pending:'待执行',completed:'已完成',attempted:'已尝试未完成',disabled:'未启用',outside_schedule:'日期未到',not_selected:'未选择',stopped_after_error:'前序失败',cancelled:'已取消'};
+const resultLabels={success:'已完成',failed:'运行失败',cancelled:'已取消',partial:'部分完成',nothing_to_do:'无待执行任务',skipped:'已跳过'};
+
+function statusRow(item, label, detail){
+  const row=document.createElement('li');
+  const body=document.createElement('div');
+  const name=document.createElement('strong');
+  name.textContent=item.name||item.id;
+  body.append(name);
+  if(detail&&detail!==label){
+    const note=document.createElement('small');
+    note.textContent=detail;
+    body.append(note);
+  }
+  const state=document.createElement('span');
+  state.className='state-chip';
+  state.dataset.state=item.status;
+  state.textContent=label;
+  row.append(body,state);
+  return row;
+}
+
+function renderDashboard(plan){
+  $('plan-date').textContent='任务日 '+plan.date+(dirty?' · 当前显示已保存计划':'');
+  for(const status of ['pending','completed','attempted']){
+    $(status+'-count').textContent=plan.items.filter(item=>item.status===status).length;
+  }
+  const today=[],excluded=[];
+  for(const item of plan.items){
+    const active=['pending','completed','attempted'].includes(item.status);
+    const note=item.status==='attempted'?item.reason:'';
+    (active?today:excluded).push(statusRow(item,planLabels[item.status]||item.reason,note));
+  }
+  if(!today.length){
+    const message=document.createElement('li');
+    message.className='empty';
+    message.textContent='今天没有已启用且符合执行日期的任务。';
+    today.push(message);
+  }
+  $('plan-list').replaceChildren(...today);
+  $('excluded-list').replaceChildren(...excluded);
+  $('excluded-plan').hidden=!excluded.length;
+  $('excluded-plan-label').textContent='其他任务（'+excluded.length+'）';
+}
+
+let lastResultJSON;
+function renderResult(result){
+  const json=result?JSON.stringify(result,null,2):'';
+  if(json===lastResultJSON)return;
+  lastResultJSON=json;
+  const tasks=result?.tasks||[],notRun=result?.not_run||[];
+  const outcome=result?(resultLabels[result.status]||'运行结束'):'暂无记录';
+  const finished=(result?.finished_at||result?.started_at||'').replace('T',' ');
+  const counts=['success','skipped','failed','cancelled'].map(status=>{
+    const total=tasks.filter(task=>task.status===status).length;
+    return total?({success:'完成',skipped:'跳过',failed:'失败',cancelled:'取消'})[status]+' '+total+' 项':'';
+  }).filter(Boolean);
+  if(notRun.length)counts.push('未执行 '+notRun.length+' 项');
+  const summary=[result?.setup_error,counts.join(' · ')].filter(Boolean).join(' · ');
+  $('last-outcome').textContent=outcome;
+  $('last-outcome').dataset.state=result?.status||'';
+  $('last-summary').textContent=[finished,summary].filter(Boolean).join(' ｜ ')||(result?'':'完成一次运行后，可在这里查看结果。');
+  $('result-date').textContent=finished;
+  $('result-overview').textContent=result?[outcome,summary].filter(Boolean).join(' · '):'暂无运行结果。';
+  $('result-list').replaceChildren(...tasks.map(task=>statusRow(task,resultLabels[task.status]||task.status,task.message)));
+  $('not-run-label').textContent='未执行任务（'+notRun.length+'）';
+  $('not-run-list').replaceChildren(...notRun.map(task=>statusRow(task,planLabels[task.status]||resultLabels[task.status]||'未执行',task.reason)));
+  $('not-run-details').hidden=!notRun.length;
+  $('result-details').hidden=!result;
+  $('result-json').textContent=json;
+}
+
 function showPlanSummary(){
   if(!config||!dailyPlan)return;
   const enabled=config.tasks.filter(t=>t.enabled).length;
   const pending=dailyPlan.items.filter(t=>t.status==='pending').length;
   $('daily-plan').textContent=dailyPlan.date+' · 已启用 '+enabled+' / '+config.tasks.length+' 项 · 已保存计划待执行 '+pending+' 项';
 }
-async function save(){if($('smtp-auth-code').value.trim()&&typeof config.notifications?.email?.has_authorization_code!=='boolean')throw new Error('请重新启动助手后再保存 SMTP 授权码');applyTask();collectFields();await api('config','POST',config);removedTasks.length=0;$('undo-delete').hidden=true;config=await api('config');loadFields();await updatePlan();toast('配置已保存')}
-async function doctor(){await save();const result=await api('doctor','POST',{});const text=result.serial+' · '+result.size.join('×')+' · 游戏'+(result.installed?'已安装':'未安装');$('doctor-result').textContent=text;toast(text,!result.installed)}
-async function run(tasks=null,force=false){await save();await api('run','POST',{tasks,force});tab('logs');await updateStatus()}
+async function save(){
+  if($('smtp-auth-code').value.trim()&&typeof config.notifications?.email?.has_authorization_code!=='boolean'){
+    throw new Error('请重新启动助手后再保存 SMTP 授权码');
+  }
+  applyTask();
+  collectFields();
+  const editable=[$('manage'),$('emulator'),$('notifications'),$('capture')];
+  editable.forEach(section=>section.inert=true);
+  try{
+    await api('config','POST',config);
+    config=await api('config');
+    removedTasks.length=0;
+    $('undo-delete').hidden=true;
+    loadFields();
+    dirty=false;
+    updateControls();
+    await updatePlan();
+    toast('配置已保存');
+  }finally{
+    editable.forEach(section=>section.inert=false);
+  }
+}
+async function doctor(){if(dirty)await save();const result=await api('doctor','POST',{});const text=result.serial+' · '+result.size.join('×')+' · 游戏'+(result.installed?'已安装':'未安装');$('doctor-result').textContent=text;toast(text,!result.installed)}
+async function run(tasks=null,force=false){
+  if(dirty)await save();
+  await api('run','POST',{tasks,force});
+  if(tasks)tab('logs');
+  await updateStatus();
+}
 async function resetToday(){
   const date=dailyPlan?.date;
   if(!date||!await confirmAction('重置 '+date+' 的执行记录？下次运行时可重新执行当天任务。'))return;
@@ -173,16 +279,27 @@ $('reset-today').onclick=withAction(resetToday);
 let lastPlanRead=0, online=false, busy=false;
 function updateControls(){
   const running=!!runStatus?.running;
-  $('run-top').disabled=!online||running||busy;
+  $('home-run').disabled=!online||running||busy;
+  $('home-run').textContent=dirty?'保存并运行今日任务':'运行今日任务';
+  $('home-stop').disabled=!online||!running;
+  $('stop-top').hidden=!running||$('tasks').classList.contains('active');
   $('stop-top').disabled=!online||!running;
   $('reset-today').disabled=!online||running||busy||!dailyPlan;
-  $('save-top').disabled=!online||running||busy;
+  $('save-top').disabled=!online||running||busy||!dirty;
+  $('doctor').disabled=$('test-email').disabled=!online||running||busy;
+  $('save-state').textContent=!config?'配置载入中':dirty?'有未保存的更改':'配置已保存';
+  $('save-state').classList.toggle('unsaved',dirty);
+  if(dailyPlan)$('plan-date').textContent='任务日 '+dailyPlan.date+(dirty?' · 当前显示已保存计划':'');
+  $('doctor').textContent=dirty?'保存并检测连接':'检测连接';
+  $('test-task').textContent=dirty?'保存并测试此任务':'仅测试此任务';
+  $('test-email').textContent=dirty?'保存并发送测试邮件':'发送测试邮件';
   $('test-task').disabled=!online||running||busy;
 }
 async function updatePlan(){
   const plan=await api('plan');
   if(JSON.stringify(plan)!==JSON.stringify(dailyPlan)){
     dailyPlan=plan;
+    renderDashboard(plan);
     renderTasks(false);
   }
   lastPlanRead=Date.now();
@@ -191,21 +308,19 @@ async function updateStatus(){
   const wasRunning=runStatus?.running;
   runStatus=await api('status');
   online=true;
-  const result=runStatus.result;
-  const attention=result?.attention_required;
+  const result=runStatus.running?runStatus.last_result:(runStatus.result||runStatus.last_result);
+  const attention=runStatus.running?null:result?.attention_required;
   $('attention-alert').hidden=!attention;
   $('attention-alert').textContent=attention?.message||'';
-  const labels={failed:'失败',success:'完成',cancelled:'已停止',partial:'部分完成'};
-  $('run-badge').textContent=runStatus.running?'运行中':attention?'需要处理':labels[result?.status]||'待机';
-  $('run-badge').className='badge '+(runStatus.running?'run':result?.status==='failed'?'bad':result?.status==='success'?'ok':'');
+  $('run-badge').textContent=runStatus.running?'任务运行中':attention?'需要处理':'服务就绪';
+  $('run-badge').className='badge '+(attention?'bad':runStatus.running?'run':'ok');
   const log=$('full-log'),content=(runStatus.logs||[]).join('\n')||'尚无日志';
   if(log.textContent!==content){
     const atEnd=log.scrollTop+log.clientHeight>=log.scrollHeight-8;
     log.textContent=content;
     if(atEnd)log.scrollTop=log.scrollHeight;
   }
-  $('result-details').hidden=!result;
-  $('result-json').textContent=result?JSON.stringify(result,null,2):'';
+  renderResult(result);
   updateControls();
   if(runStatus.running||wasRunning||Date.now()-lastPlanRead>=30000)await updatePlan();
 }
@@ -225,7 +340,11 @@ function withAction(action){
     try{await action()}finally{busy=false;updateControls()}
   });
 }
-$('test-email').onclick=protect(async()=>{const button=$('test-email');button.disabled=true;try{await save();await api('test-email','POST',{});toast('测试邮件已发送')}finally{button.disabled=false}});
+$('test-email').onclick=withAction(async()=>{
+  if(dirty)await save();
+  await api('test-email','POST',{});
+  toast('测试邮件已发送');
+});
 let screenshotId=null, latestRefresh=0;
 async function refreshScreen(){
   const request=++latestRefresh;
@@ -257,7 +376,7 @@ function drawScreen(){if(!screenImage)return;const canvas=$('screen'),ctx=canvas
 function point(event){const rect=$('screen').getBoundingClientRect();return [Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)),Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height))]}
 $('screen').onpointerdown=e=>{dragStart=point(e);$('screen').setPointerCapture(e.pointerId)};
 $('screen').onpointermove=e=>{if(!dragStart||document.querySelector('input[name="screen-mode"]:checked').value!=='crop')return;const p=point(e);selection=[Math.min(dragStart[0],p[0]),Math.min(dragStart[1],p[1]),Math.max(dragStart[0],p[0]),Math.max(dragStart[1],p[1])];drawScreen()};
-$('screen').onpointerup=protect(async(e)=>{if(!dragStart)return;const start=dragStart;dragStart=null;const p=point(e);if(document.querySelector('input[name="screen-mode"]:checked').value==='tap'){await api('tap','POST',{x:p[0],y:p[1]});if($('record-tap').checked&&config.tasks[selected]){applyTask();config.tasks[selected].steps.push({type:'tap',x:Number(p[0].toFixed(4)),y:Number(p[1].toFixed(4)),wait:0.5});fillTask();toast('已点击，并记录到 '+config.tasks[selected].name)}else toast('已点击模拟器');setTimeout(()=>refreshScreen().catch(e=>toast(e.message,true)),600);return}selection=[Math.min(start[0],p[0]),Math.min(start[1],p[1]),Math.max(start[0],p[0]),Math.max(start[1],p[1])];$('selection-info').textContent='已框选 '+Math.round((selection[2]-selection[0])*$('screen').width)+'×'+Math.round((selection[3]-selection[1])*$('screen').height)+' 像素';drawScreen()});
+$('screen').onpointerup=protect(async(e)=>{if(!dragStart)return;const start=dragStart;dragStart=null;const p=point(e);if(document.querySelector('input[name="screen-mode"]:checked').value==='tap'){await api('tap','POST',{x:p[0],y:p[1],screenshot_id:screenshotId});if($('record-tap').checked&&config.tasks[selected]){applyTask();markDirty();config.tasks[selected].steps.push({type:'tap',x:Number(p[0].toFixed(4)),y:Number(p[1].toFixed(4)),wait:0.5});fillTask();toast('已点击，并记录到 '+config.tasks[selected].name)}else toast('已点击模拟器');setTimeout(()=>refreshScreen().catch(e=>toast(e.message,true)),600);return}selection=[Math.min(start[0],p[0]),Math.min(start[1],p[1]),Math.max(start[0],p[0]),Math.max(start[1],p[1])];$('selection-info').textContent='已框选 '+Math.round((selection[2]-selection[0])*$('screen').width)+'×'+Math.round((selection[3]-selection[1])*$('screen').height)+' 像素';drawScreen()});
 async function listTemplates(){const files=await api('templates');const box=$('template-list'),options=$('template-options');box.textContent='';options.textContent='';files.forEach(name=>{const item=document.createElement('span');item.textContent=name;box.append(item);const option=document.createElement('option');option.value=name;options.append(option)});if(!files.length)box.textContent='暂无模板'}
 async function saveTemplate(){
   if(!selection||!screenshotId)throw new Error('请先在截图上框选按钮');
@@ -269,14 +388,15 @@ async function saveTemplate(){
 }
 $('save-top').onclick=withAction(save);
 $('doctor').onclick=withAction(doctor);
-$('run-top').onclick=withAction(()=>run());
-$('stop-top').onclick=protect(async()=>{await api('stop','POST',{});toast('正在停止任务');await updateStatus()});
+$('home-run').onclick=withAction(()=>run());
+$('home-stop').onclick=$('stop-top').onclick=protect(async()=>{await api('stop','POST',{});toast('正在停止任务');await updateStatus()});
 $('test-task').onclick=withAction(()=>run([$('task-id').value.trim()],true));
 $('refresh-screen').onclick=protect(refreshScreen);
 $('save-template').onclick=protect(saveTemplate);
 let presets=null;
 const removedTasks=[];
 function addToList(task,index){
+  markDirty();
   config.tasks.splice(index,0,task);
   selected=index;
   renderTasks();
@@ -321,6 +441,7 @@ async function removeTask(index){
   if(!await confirmAction('删除「'+task.name+'」？保存后生效。'))return;
   applyTask();
   removedTasks.push({index,task});
+  markDirty();
   config.tasks.splice(index,1);
   selected=current===task?Math.max(0,Math.min(index,config.tasks.length-1)):config.tasks.indexOf(current);
   $('undo-delete').hidden=false;
@@ -332,14 +453,23 @@ $('undo-delete').onclick=protect(()=>{
   if(!item)return;
   if(config.tasks.some(t=>t.id===item.task.id))throw new Error('此任务 ID 已存在');
   removedTasks.pop();
+  markDirty();
   selected=Math.min(item.index,config.tasks.length);
   config.tasks.splice(selected,0,item.task);
   $('undo-delete').hidden=!removedTasks.length;
   renderTasks();
 });
 $('add-step').onclick=protect(async()=>addStep());$('task-steps').oninput=()=>renderStepList();
-$('move-up').onclick=protect(async()=>{applyTask();if(selected>0){[config.tasks[selected-1],config.tasks[selected]]=[config.tasks[selected],config.tasks[selected-1]];selected--;renderTasks()}});
-$('move-down').onclick=protect(async()=>{applyTask();if(selected<config.tasks.length-1){[config.tasks[selected+1],config.tasks[selected]]=[config.tasks[selected],config.tasks[selected+1]];selected++;renderTasks()}});
+$('move-up').onclick=protect(async()=>{applyTask();if(selected>0){[config.tasks[selected-1],config.tasks[selected]]=[config.tasks[selected],config.tasks[selected-1]];selected--;markDirty();renderTasks()}});
+$('move-down').onclick=protect(async()=>{applyTask();if(selected<config.tasks.length-1){[config.tasks[selected+1],config.tasks[selected]]=[config.tasks[selected],config.tasks[selected+1]];selected++;markDirty();renderTasks()}});
+function markDirty(){
+  dirty=true;
+  updateControls();
+}
+document.addEventListener('input',event=>{
+  const input=event.target;
+  if(input.matches('#emulator input,#emulator textarea,#notifications input,#notifications textarea,#notifications select,#task-id,#task-name,#task-kind,#task-schedule,#task-steps,#flow-options input,#flow-options select'))markDirty();
+});
 (async()=>{
   try{
     config=await api('config');

@@ -140,7 +140,7 @@ class BonusTest(unittest.TestCase):
         flow._tap = Mock()
         home = TextHit("首页", .99, 780, 80, 42, 18)
         def match(frame, directory, options):
-            self.assertEqual(frame, b"one frame")
+            self.assertEqual(frame.png, b"one frame")
             return (800, 90) if options["image"] == "home_active.png" else None
         with patch("hka.game_flows.find_image", match), patch("hka.game_flows.read_text", return_value=[home]):
             flow._home()

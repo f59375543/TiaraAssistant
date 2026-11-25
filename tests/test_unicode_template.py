@@ -2,12 +2,33 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
-from hka.vision import VisionError, crop_template, find_image
+from hka import vision
+from hka.vision import ImageFrame, VisionError, crop_template, find_image
 
 
 class UnicodeTemplateTests(unittest.TestCase):
+    def test_reuses_decodes_and_detects_replaced_template(self):
+        image = Image.new("RGB", (20, 20), "red")
+        image.putpixel((5, 5), (0, 255, 0))
+        png = io.BytesIO()
+        image.save(png, format="PNG")
+        frame = ImageFrame(png.getvalue())
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            path = directory / "按钮.png"
+            image.crop((2, 2, 12, 12)).save(path)
+            step = {"image": path.name}
+            with patch("hka.vision._decode_color", wraps=vision._decode_color) as decode:
+                self.assertEqual(find_image(frame, directory, step)[:2], (7, 7))
+                self.assertEqual(find_image(frame, directory, step)[:2], (7, 7))
+                self.assertEqual(decode.call_count, 2)
+                image.crop((0, 0, 16, 16)).save(path)
+                self.assertEqual(find_image(frame, directory, step)[:2], (8, 8))
+                self.assertEqual(decode.call_count, 3)
+
     def test_existing_solid_color_template_cannot_match_unrelated_screen(self):
         png = io.BytesIO()
         Image.new("RGB", (80, 60), "blue").save(png, format="PNG")

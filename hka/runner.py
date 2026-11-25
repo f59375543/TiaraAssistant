@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
@@ -9,6 +10,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .adb import AdbDevice
 from .cancellation import Cancelled
@@ -24,6 +26,31 @@ class SkipTask(Exception):
 
 class BreakRepeat(Exception):
     pass
+
+
+class RunBusyError(RuntimeError):
+    """Another process holds the execution lock for this installation."""
+
+
+def load_latest_report(run_dir: Path) -> dict[str, Any] | None:
+    for path in sorted(run_dir.glob("run_*.json"), reverse=True):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, RecursionError):
+            continue
+        if (isinstance(report, dict) and report.get("status") in ("success", "partial", "failed", "cancelled")
+                and isinstance(report.get("tasks"), list) and isinstance(report.get("finished_at"), str)):
+            return report
+    return None
+
+
+def _write_report(path: Path, result: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class TaskRunner:
@@ -93,7 +120,7 @@ class TaskRunner:
         return items
 
     @contextmanager
-    def _exclusive_run(self):
+    def exclusive_run(self):
         # The GUI, daemon, and standalone CLI may share an installation.
         # Closing this handle releases the OS lock even if the process exits.
         with (self.base / ".task-run.lock").open("a+b") as handle:
@@ -106,12 +133,29 @@ class TaskRunner:
                     import fcntl
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
-                raise RuntimeError("另一个流程正在运行或重置，请等待结束") from exc
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise RunBusyError("另一个流程正在运行或重置，请等待结束") from exc
+                raise
             yield
 
+    _exclusive_run = exclusive_run
+
     def run(self, *, task_ids: set[str] | None = None, force: bool = False) -> dict[str, Any]:
-        with self._exclusive_run():
-            return self._run(task_ids=task_ids, force=force)
+        with self.exclusive_run():
+            result = self._run(task_ids=task_ids, force=force)
+            if result["status"] == "nothing_to_do":
+                return result
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            report_path = self.run_dir / f"run_{stamp}_{uuid4().hex[:12]}.json"
+            _write_report(report_path, result)
+        if result["status"] != "cancelled":
+            self._notify(result)
+            if result["notification_errors"]:
+                try:
+                    _write_report(report_path, result)
+                except OSError as exc:
+                    self.log(f"通知结果写入失败：{exc}")
+        return result
 
     def _run(self, *, task_ids: set[str] | None, force: bool) -> dict[str, Any]:
         self.today = execution_day(self.config.get("runtime", {}), datetime.now())
@@ -157,9 +201,7 @@ class TaskRunner:
             self._screen_size = self.device.size()
             self.log(f"已连接 {self.device.serial}，画面 {self._screen_size[0]}×{self._screen_size[1]}")
             for index, task in enumerate(tasks):
-                if self.cancel.is_set():
-                    result["cancelled"] = True
-                    break
+                self._check_cancel()
                 self._task_details = {}
                 try:
                     task_day = execution_day(self.config.get("runtime", {}), datetime.now())
@@ -182,7 +224,7 @@ class TaskRunner:
                     self._mark_done(task["id"], task_day)
                 except Cancelled:
                     result["cancelled"] = True
-                    break
+                    status, message = "cancelled", "执行中已停止，未确认完成"
                 except SkipTask as exc:
                     status, message = "skipped", str(exc)
                 except EquipmentFull as exc:
@@ -219,6 +261,8 @@ class TaskRunner:
                         message = f"快捷战斗完成 {quick['battles']} 场（确认 {quick['operations']} 次）；剩余免费次数 {quick['remaining_free']}"
                         result["tasks"][-1]["message"] = message
                 self.log(f"{task['name']}: {status} {message}")
+                if status == "cancelled":
+                    break
                 if status == "failed" and (result.get('attention_required') or task.get("required", False) or self.config.get("runtime", {}).get("stop_on_error", False)):
                     reason = result['attention_required']['message'] if result.get('attention_required') else ("游戏启动或登录失败，无法继续" if task.get("required", False) else "前项失败，已按配置停止")
                     self.log(reason)
@@ -235,24 +279,38 @@ class TaskRunner:
             self.log(f"连接或启动失败: {exc}")
         finally:
             if started and (self.cancel.is_set() or self.config["emulator"].get("stop_after_run", False)):
-                self.device.stop_emulator()
+                try:
+                    self.device.stop_emulator()
+                except Exception as exc:
+                    result["cleanup_error"] = str(exc)
+                    self.log(f"关闭模拟器失败：{exc}")
         result["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        failed = bool(result.get("setup_error")) or any(item["status"] == "failed" for item in result["tasks"])
+        failed = bool(result.get("setup_error") or result.get("cleanup_error")) or any(item["status"] == "failed" for item in result["tasks"])
         result["status"] = "cancelled" if result.get("cancelled") else ("failed" if failed else "success")
         if result.get("cancelled"):
+            recorded = {item["id"] for item in result["tasks"] + result["not_run"]}
+            result["not_run"].extend({"id": task["id"], "name": task["name"],
+                                      "status": "not_started", "reason": "运行已停止，本项尚未开始"}
+                                     for task in tasks if task["id"] not in recorded)
             self.log("任务已停止")
+        return result
+
+    def _notify(self, result: dict[str, Any]) -> None:
+        failed = result["status"] == "failed"
         lines = [f"运行时间: {result['started_at']}", f"结果: {result['status']}"]
         if result.get("setup_error"):
             lines.append(f"连接错误: {result['setup_error']}")
+        if result.get("cleanup_error"):
+            lines.append(f"关闭模拟器失败: {result['cleanup_error']}")
         lines += [f"{item['name']}: {item['status']} {item['message']}" for item in result["tasks"]]
-        if not result.get("cancelled"):
-            title = '装备仓库已满，需要处理' if result.get('attention_required') else "崩坏2任务执行" + ("失败" if failed else "完成")
-            result["notification_errors"] = send_notifications(self.config, success=not failed, title=title, body="\n".join(lines))
+        title = '装备仓库已满，需要处理' if result.get('attention_required') else "崩坏2任务执行" + ("失败" if failed else "完成")
+        try:
+            result["notification_errors"] = send_notifications(self.config, success=not failed, title=title,
+                                                               body="\n".join(lines), cancel=self.cancel)
+        except Exception as exc:
+            result["notification_errors"] = [str(exc)]
         for error in result["notification_errors"]:
             self.log(f"通知发送失败: {error}")
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        (self.run_dir / f"run_{stamp}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return result
 
     def _steps(self, steps: list[dict[str, Any]]) -> None:
         for step in steps:
@@ -366,7 +424,7 @@ class TaskRunner:
         return True
 
     def reset_today(self) -> int:
-        with self._exclusive_run():
+        with self.exclusive_run():
             return self._reset_today()
 
     def _reset_today(self) -> int:

@@ -7,6 +7,7 @@ import ssl
 import smtplib
 import urllib.request
 from email.message import EmailMessage
+from threading import Event
 from typing import Any
 from .mail_credentials import unprotect_secret
 
@@ -51,7 +52,8 @@ def send_email(settings: dict, *, title: str, body: str) -> None:
         raise ValueError(str(exc).replace(secret, '[已隐藏]')) from None
 
 
-def send_notifications(config: dict[str, Any], *, success: bool, title: str, body: str) -> list[str]:
+def send_notifications(config: dict[str, Any], *, success: bool, title: str, body: str,
+                       cancel: Event | None = None) -> list[str]:
     settings = config.get("notifications", {})
     if not settings.get("on_success" if success else "on_error", True):
         return []
@@ -59,6 +61,9 @@ def send_notifications(config: dict[str, Any], *, success: bool, title: str, bod
     for index, item in enumerate(settings.get("webhooks", [])):
         if not item.get("enabled", True):
             continue
+        if cancel is not None and cancel.is_set():
+            errors.append("运行已停止，剩余通知已跳过")
+            return errors
         url = item.get("url", "")
         if not url.startswith(("https://", "http://")):
             errors.append(f"Webhook {index + 1}: URL 无效")
@@ -73,6 +78,9 @@ def send_notifications(config: dict[str, Any], *, success: bool, title: str, bod
             errors.append(f"Webhook {index + 1}: {exc}")
     email = settings.get("email", {})
     if email.get("enabled"):
+        if cancel is not None and cancel.is_set():
+            errors.append("运行已停止，邮件通知已跳过")
+            return errors
         try:
             send_email(email, title=title, body=body)
         except Exception as exc:

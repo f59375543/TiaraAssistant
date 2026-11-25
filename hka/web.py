@@ -4,19 +4,22 @@ import json
 import errno
 import copy
 import hashlib
+import io
 import os
 import socket
 import threading
 import time
 import webbrowser
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from PIL import Image
 
 from .adb import AdbDevice
 from .config import ConfigError, load_config, save_config, normalize_config, task_presets
-from .runner import TaskRunner
+from .runner import TaskRunner, load_latest_report
 from .vision import crop_template, template_path
 from .mail_credentials import protect_secret
 from .notify import email_options, send_email
@@ -82,11 +85,26 @@ def save_config_snapshot(path: Path, data: dict) -> str:
     return config_revision(path)
 
 
+@dataclass(frozen=True)
+class CapturedFrame:
+    id: str
+    png: bytes
+    serial: str
+    size: tuple[int, int]
+    emulator: dict
+    manual_input_allowed: bool
+
+
+class StaleFrame(ValueError):
+    pass
+
+
 class WebState:
     def __init__(self, config_path: Path, request_window_close=None):
         self.config_path = config_path
         self.request_window_close = request_window_close
         self.lock = threading.Lock()
+        self.device_lock = threading.Lock()
         self.running = False
         self.closing = threading.Event()
         self.worker = None
@@ -94,7 +112,61 @@ class WebState:
         self.cancel = threading.Event()
         self.logs: list[str] = []
         self.result: dict | None = None
-        self.last_screenshot: tuple[str, bytes] | None = None
+        self.last_result: dict | None = None
+        try:
+            runtime = load_config(config_path).get("runtime", {})
+            self.last_result = load_latest_report(config_path.parent / runtime.get("run_dir", "logs"))
+        except (ConfigError, OSError, TypeError) as exc:
+            self.log(f"无法载入上次运行记录：{exc}")
+        self.last_screenshot: CapturedFrame | None = None
+
+    def capture(self) -> CapturedFrame:
+        with self.device_lock:
+            with self.lock:
+                manual_input_allowed = not self.running
+            emulator = load_config(self.config_path)["emulator"]
+            device = AdbDevice(emulator)
+            device.cancel = self.closing
+            device.connect()
+            png = device.screen()
+            with Image.open(io.BytesIO(png)) as image:
+                frame = CapturedFrame(uuid.uuid4().hex, png, device.serial, image.size,
+                                      emulator, manual_input_allowed)
+            with self.lock:
+                self.last_screenshot = frame
+            return frame
+
+    def frame_for(self, frame_id: str | None) -> CapturedFrame:
+        with self.lock:
+            frame = self.last_screenshot
+        if frame is None or frame.id != frame_id:
+            raise StaleFrame("截图已失效，请重新获取模拟器截图")
+        return frame
+
+    def tap(self, frame_id: str | None, x: float, y: float) -> None:
+        if not 0 <= x <= 1 or not 0 <= y <= 1:
+            raise ValueError("点击坐标必须在画面内")
+        with self.device_lock:
+            with self.lock:
+                if self.running:
+                    raise RuntimeError("运行中不能手动点击")
+            frame = self.frame_for(frame_id)
+            if not frame.manual_input_allowed:
+                raise StaleFrame("这是运行中的截图，请重新获取模拟器截图")
+            config = load_config(self.config_path)
+            if config["emulator"] != frame.emulator:
+                raise StaleFrame("设备设置已更改，请重新获取模拟器截图")
+            runner = TaskRunner(config, self.config_path)
+            with runner.exclusive_run():
+                device = AdbDevice(config["emulator"])
+                device.cancel = self.closing
+                device.connect()
+                if device.serial != frame.serial or device.size() != frame.size:
+                    raise StaleFrame("设备或画面尺寸已变化，请重新获取模拟器截图")
+                with self.lock:
+                    self.last_screenshot = None
+                width, height = frame.size
+                device.tap(min(width - 1, round(x * width)), min(height - 1, round(y * height)))
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -109,6 +181,7 @@ class WebState:
             if self.running:
                 raise RuntimeError("任务正在运行")
             self.running = True
+            self.last_screenshot = None
             self.cancel = threading.Event()
             self.logs = []
             self.result = None
@@ -124,13 +197,17 @@ class WebState:
                     task_ids=set(tasks) if tasks else None, force=force)
                 with self.lock:
                     self.result = result
+                    if result.get("status") != "nothing_to_do":
+                        self.last_result = result
             except Exception as exc:
                 self.log(f"运行失败: {exc}")
                 with self.lock:
                     self.result = {"status": "failed", "setup_error": str(exc)}
+                    self.last_result = self.result
             finally:
                 with self.lock:
                     self.running = False
+                    self.last_screenshot = None
                     self.owned_devices = [item for item in self.owned_devices if item.owns_live_emulator()]
                     if device and device.owns_live_emulator():
                         self.owned_devices.append(device)
@@ -232,18 +309,12 @@ def serve(config_path: Path, port: int = 8765, *, fallback_port: bool = False,
                     return self._json({"date": runner.today.isoformat(), "items": runner.preview()})
                 if route == "/api/status":
                     with state.lock:
-                        snapshot = {"running": state.running, "logs": list(state.logs), "result": state.result}
+                        snapshot = {"running": state.running, "logs": list(state.logs),
+                                    "result": state.result, "last_result": state.last_result}
                     return self._json(snapshot)
                 if route == "/api/screenshot":
-                    config = load_config(config_path)
-                    device = AdbDevice(config["emulator"])
-                    device.cancel = state.closing
-                    device.connect()
-                    screenshot = device.screen()
-                    screenshot_id = uuid.uuid4().hex
-                    with state.lock:
-                        state.last_screenshot = (screenshot_id, screenshot)
-                    return self._bytes(screenshot, "image/png", screenshot_id=screenshot_id)
+                    frame = state.capture()
+                    return self._bytes(frame.png, "image/png", screenshot_id=frame.id)
                 if route == "/api/templates":
                     config = load_config(config_path)
                     directory = config_path.parent / config.get("runtime", {}).get("template_dir", "templates")
@@ -265,7 +336,7 @@ def serve(config_path: Path, port: int = 8765, *, fallback_port: bool = False,
                     raise ValueError("请求太大")
                 data = json.loads(self.rfile.read(length) or b"{}")
                 if route == "/api/config":
-                    with state.lock:
+                    with state.device_lock, state.lock:
                         if state.running:
                             raise RuntimeError("运行中不能修改配置")
                         revision = save_config_snapshot(config_path, data)
@@ -290,39 +361,26 @@ def serve(config_path: Path, port: int = 8765, *, fallback_port: bool = False,
                         reset_count = runner.reset_today()
                     return self._json({"ok": True, "reset_count": reset_count})
                 if route == "/api/run":
-                    state.start_run(data.get("tasks"), bool(data.get("force", False)))
+                    with state.device_lock:
+                        state.start_run(data.get("tasks"), bool(data.get("force", False)))
                     return self._json({"ok": True})
                 if route == "/api/stop":
                     state.cancel.set()
                     state.log("收到停止请求，正在中断当前任务")
                     return self._json({"ok": True})
                 if route == "/api/tap":
-                    with state.lock:
-                        if state.running:
-                            raise RuntimeError("运行中不能手动点击")
-                    x, y = float(data["x"]), float(data["y"])
-                    if not 0 <= x <= 1 or not 0 <= y <= 1:
-                        raise ValueError("点击坐标必须在画面内")
-                    device = AdbDevice(load_config(config_path)["emulator"])
-                    device.cancel = state.closing
-                    device.connect()
-                    width, height = device.size()
-                    device.tap(round(x * width), round(y * height))
+                    state.tap(data.get("screenshot_id"), float(data["x"]), float(data["y"]))
                     return self._json({"ok": True})
                 if route == "/api/template":
                     config = load_config(config_path)
                     directory = (config_path.parent / config.get("runtime", {}).get("template_dir", "templates")).resolve()
                     path = template_path(directory, data["name"])
-                    with state.lock:
-                        frame = state.last_screenshot
-                    if frame is None:
-                        raise ValueError("请先获取模拟器截图")
-                    screenshot_id, screenshot = frame
-                    if data.get("screenshot_id") != screenshot_id:
-                        return self._json({"error": "截图已更新，请重新获取截图并框选模板"}, 409)
-                    size = crop_template(screenshot, data["box"], path)
+                    frame = state.frame_for(data.get("screenshot_id"))
+                    size = crop_template(frame.png, data["box"], path)
                     return self._json({"ok": True, "name": path.name, "size": size})
                 self._json({"error": "未找到接口"}, 404)
+            except StaleFrame as exc:
+                self._json({"error": str(exc)}, 409)
             except Exception as exc:
                 self._json({"error": str(exc)}, 400)
 
