@@ -87,3 +87,8 @@ class GuildDailyTests(unittest.TestCase):
         flow = simulate(SUCCESS, guild_page("不可领"))
         self.assertTrue(flow.claim_guild_daily({})["claimed"])
         self.assert_taps(flow, CONFIRM)
+
+    def test_resumes_open_reward_dialog(self):
+        flow = simulate(REWARD, guild_page("已领取"))
+        self.assertTrue(flow.claim_guild_daily({})["claimed"])
+        self.assert_taps(flow, CLAIM)

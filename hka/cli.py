@@ -44,14 +44,16 @@ def main(argv: list[str] | None = None) -> int:
             (path.parent / "templates").mkdir(exist_ok=True)
             print(f"已创建 {path}")
             return 0
-        config = load_config(path)
+        if args.command != "daemon":
+            config = load_config(path)
         if args.command == "doctor":
             device = AdbDevice(config["emulator"])
             device.connect()
             print(f"ADB 已连接: {device.serial}")
-            print(f"游戏安装: {'是' if device.installed() else '否'} ({device.package})")
+            installed = device.installed()
+            print(f"游戏安装: {'是' if installed else '否'} ({device.package})")
             print(f"截图尺寸: {device.size()}")
-            return 0
+            return 0 if installed else 1
         if args.command == "plan":
             tasks = TaskRunner(config, path).plan()
             print("\n".join(f"{item['id']}: {item['name']}" for item in tasks) or "当前没有待执行任务")
@@ -82,11 +84,13 @@ def main(argv: list[str] | None = None) -> int:
                     target += timedelta(days=1)
                 while (target - datetime.now()).total_seconds() > 0:
                     time.sleep(min(30, max(0.1, (target - datetime.now()).total_seconds())))
-                config = load_config(path)
                 try:
+                    config = load_config(path)
                     TaskRunner(config, path).run()
                 except RunBusyError as exc:
                     print(f"{target:%Y-%m-%d %H:%M} 已跳过本次定时任务：{exc}", flush=True)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f"{target:%Y-%m-%d %H:%M} 定时任务失败：{exc}", file=sys.stderr, flush=True)
         if args.command == "serve":
             from .web import serve as web_serve
             web_serve(path, args.port)

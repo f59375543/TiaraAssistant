@@ -19,7 +19,7 @@ class ActivityPriorityTests(unittest.TestCase):
         flow = GameFlows(Mock())
         flow._battle_picker = Mock()
         flow._click = Mock()
-        flow._hits = Mock(return_value=hits)
+        flow._hits = Mock(side_effect=[hits, []])
         flow._tap = Mock()
         flow._swipe = Mock()
         flow._screen = Mock()

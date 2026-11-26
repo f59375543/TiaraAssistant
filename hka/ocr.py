@@ -33,7 +33,11 @@ def read_text(png: bytes, region: tuple[float, float, float, float] = (0, 0, 1, 
         width, height = image.size
         left, top = round(region[0] * width), round(region[1] * height)
         right, bottom = round(region[2] * width), round(region[3] * height)
-        crop = image.convert("RGB").crop((left, top, right, bottom))
+        crop = image.crop((left, top, right, bottom)).convert("RGB")
+    return _read_pixels(crop, min_score, left, top)
+
+
+def _read_pixels(crop: Image.Image, min_score: float, left: int = 0, top: int = 0) -> list[TextHit]:
     result = _engine()(crop)
     hits = []
     texts = result.txts if result.txts is not None else []
@@ -76,13 +80,11 @@ def read_stamina_hud(png: bytes) -> list[TextHit]:
     left, top, right, bottom = 280, 72, 500, 140
     scale = 3
     with Image.open(io.BytesIO(png)) as image:
-        crop = image.convert("RGB").crop((left, top, right, bottom))
+        crop = image.crop((left, top, right, bottom)).convert("RGB")
         crop = crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS)
-        output = io.BytesIO()
-        crop.save(output, format="PNG")
     return [TextHit(hit.text, hit.score, left + hit.x // scale, top + hit.y // scale,
                     hit.width // scale, hit.height // scale)
-            for hit in read_text(output.getvalue(), min_score=0.85)]
+            for hit in _read_pixels(crop, 0.85)]
 
 
 def _stamina_value(hits: list[TextHit], *, doubled: bool) -> int | None:
@@ -123,9 +125,6 @@ def stage_labels(png: bytes) -> list[TextHit]:
     orange = cv2.inRange(hsv, (5, 130, 130), (30, 255, 255))
     prepared = cv2.resize(255 - orange, None, fx=2, fy=2,
                           interpolation=cv2.INTER_NEAREST)
-    ok, encoded = cv2.imencode(".png", prepared)
-    if not ok:
-        return []
-    hits = read_text(encoded.tobytes(), min_score=0.3)
+    hits = _read_pixels(Image.fromarray(prepared).convert("RGB"), 0.3)
     return [TextHit(hit.text, hit.score, 170 + hit.x // 2, 190 + hit.y // 2,
                     hit.width // 2, hit.height // 2) for hit in hits]

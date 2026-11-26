@@ -15,9 +15,9 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyTitle("蒂亚拉小助手")]
 [assembly: AssemblyProduct("蒂亚拉小助手")]
 [assembly: AssemblyDescription("崩坏学园2每日任务助手")]
-[assembly: AssemblyVersion("2026.11.25.0")]
-[assembly: AssemblyFileVersion("2026.11.25.0")]
-[assembly: AssemblyInformationalVersion("v2026.11.25")]
+[assembly: AssemblyVersion("2026.11.26.0")]
+[assembly: AssemblyFileVersion("2026.11.26.0")]
+[assembly: AssemblyInformationalVersion("v2026.11.26")]
 
 internal static class Program
 {
@@ -93,11 +93,15 @@ internal sealed class Assistant : Form
             info.StandardOutputEncoding = info.StandardErrorEncoding = Encoding.UTF8;
             service = Process.Start(info);
             var errors = service.StandardError.ReadToEndAsync();
-            string address = await service.StandardOutput.ReadLineAsync();
+            ShowStatus("正在启动后台服务和 WebView2 环境…");
+            var addressReady = StartupStage(service.StandardOutput.ReadLineAsync(), "后台服务就绪");
+            var browserReady = StartupStage(PrepareEnvironment(), "创建 WebView2 环境");
+            await Task.WhenAll(addressReady, browserReady);
+            string address = await addressReady;
             if (closing) return;
             Uri uri;
             if (!Uri.TryCreate(address, UriKind.Absolute, out uri) || uri.Scheme != "http" || uri.Host != "127.0.0.1")
-                throw new IOException("后台启动失败。\n" + await errors);
+                throw new IOException("后台未提供有效的本地服务地址。\n" + (service.HasExited ? await errors : address));
 
             service.EnableRaisingEvents = true;
             service.Exited += delegate {
@@ -109,15 +113,9 @@ internal sealed class Assistant : Form
             view = new WebView2();
             view.Dock = DockStyle.Fill;
             Controls.Add(view);
-            string data = Path.Combine(root, "data");
-            string profile = Path.Combine(data, "webview-profile");
-            string oldProfile = Path.Combine(root, @"logs\webview-profile");
-            Directory.CreateDirectory(data);
-            if (!Directory.Exists(profile) && Directory.Exists(oldProfile))
-                Directory.Move(oldProfile, profile);
-            var environment = await CoreWebView2Environment.CreateAsync(null, profile);
-            if (closing) return;
-            await view.EnsureCoreWebView2Async(environment);
+            ShowStatus("后台服务已就绪，正在初始化窗口…");
+            var environment = await browserReady;
+            await StartupStage(view.EnsureCoreWebView2Async(environment), "初始化 WebView2 窗口");
             if (closing) return;
             view.CoreWebView2.NewWindowRequested += (s, e) => { e.Handled = true; };
             view.CoreWebView2.NavigationStarting += (s, e) => {
@@ -140,6 +138,30 @@ internal sealed class Assistant : Form
         status.BringToFront();
     }
 
+    private async Task<CoreWebView2Environment> PrepareEnvironment()
+    {
+        string data = Path.Combine(root, "data");
+        string profile = Path.Combine(data, "webview-profile");
+        string oldProfile = Path.Combine(root, @"logs\webview-profile");
+        Directory.CreateDirectory(data);
+        if (!Directory.Exists(profile) && Directory.Exists(oldProfile))
+            Directory.Move(oldProfile, profile);
+        return await CoreWebView2Environment.CreateAsync(null, profile);
+    }
+
+    private static async Task StartupStage(Task operation, string stage)
+    {
+        if (await Task.WhenAny(operation, Task.Delay(30000)) != operation)
+            throw new TimeoutException(stage + "等待超过 30 秒。可关闭窗口后重试。");
+        await operation;
+    }
+
+    private static async Task<T> StartupStage<T>(Task<T> operation, string stage)
+    {
+        await StartupStage((Task)operation, stage);
+        return await operation;
+    }
+
     private async void CloseAssistant(object sender, FormClosingEventArgs e)
     {
         if (readyToExit) return;
@@ -152,9 +174,22 @@ internal sealed class Assistant : Form
         if (service != null)
         {
             // EOF also arrives when the window process exits unexpectedly.
-            service.StandardInput.Close();
-            await Task.Run((Action)service.WaitForExit);
-            service.Dispose();
+            try
+            {
+                service.StandardInput.Close();
+                var exit = Task.Run((Action)service.WaitForExit);
+                while (await Task.WhenAny(exit, Task.Delay(20000)) != exit)
+                {
+                    var choice = MessageBox.Show(this,
+                        "后台仍在保存或清理。继续等待吗？选择“否”将仅关闭窗口，后台继续清理。",
+                        "正在关闭助手", MessageBoxButtons.YesNo, MessageBoxIcon.Information,
+                        MessageBoxDefaultButton.Button1);
+                    if (choice == DialogResult.No) break;
+                }
+                if (exit.IsCompleted) { await exit; service.Dispose(); }
+            }
+            catch (InvalidOperationException) { /* The service already exited. */ }
+            catch (IOException) { /* The service closed its end of the pipe. */ }
         }
         readyToExit = true;
         BeginInvoke((Action)Close);

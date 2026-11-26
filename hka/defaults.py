@@ -1,5 +1,13 @@
 DEFAULT_LAUNCH_STEPS = [{"type": "launch_game", "wait": 20}, {"type": "game_flow", "flow": "enter_game"}]
 
+LEGACY_POPUP_STEPS = [
+    {"type": "repeat", "times": 6, "steps": [
+        {"type": "tap_image", "image": "popup_close.png", "region": [0.65, 0.08, 0.95, 0.5],
+         "timeout": 2, "on_missing": "break_repeat", "wait": 0.7}]},
+    {"type": "tap_image", "image": "announcement_close.png", "region": [0.8, 0, 1, 0.25],
+     "timeout": 3, "on_missing": "continue", "wait": 0.7},
+]
+
 DEFAULT_CONFIG = {
     "version": 1,
     "emulator": {
@@ -25,8 +33,7 @@ DEFAULT_CONFIG = {
         {"id": "signin", "frequency": "every_run", "name": "签到、连登与生日奖励", "kind": "daily", "enabled": True, "schedule": {"type": "daily"},
          "steps": [{"type": "game_flow", "flow": "claim_login_rewards"}]},
         {"id": "dismiss_popups", "frequency": "every_run", "name": "关闭登录弹窗", "kind": "daily", "enabled": False, "schedule": {"type": "daily"},
-         "steps": [{"type": "repeat", "times": 6, "steps": [{"type": "tap_image", "image": "popup_close.png", "region": [0.65, 0.08, 0.95, 0.5], "timeout": 2, "on_missing": "break_repeat", "wait": 0.7}]},
-                   {"type": "tap_image", "image": "announcement_close.png", "region": [0.8, 0, 1, 0.25], "timeout": 3, "on_missing": "continue", "wait": 0.7}]},
+         "steps": [{"type": "game_flow", "flow": "dismiss_login_popups"}]},
         {"id": "mail", "frequency": "once_per_day", "name": "领取邮件", "kind": "daily", "enabled": False, "schedule": {"type": "daily"},
          "steps": [{"type": "game_flow", "flow": "claim_mail"}]},
         {"id": "guild_daily", "frequency": "once_per_day", "name": "领取社团每日奖励", "kind": "daily", "enabled": True,

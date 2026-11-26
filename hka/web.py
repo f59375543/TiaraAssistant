@@ -12,13 +12,14 @@ import time
 import webbrowser
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from PIL import Image
 
 from .adb import AdbDevice
-from .config import ConfigError, load_config, save_config, normalize_config, task_presets
+from .config import ConfigError, execution_day, load_config, parse_config, save_config, task_presets
 from .runner import TaskRunner, load_latest_report
 from .vision import crop_template, template_path
 from .mail_credentials import protect_secret
@@ -55,9 +56,16 @@ def config_revision(path: Path) -> str:
 
 def config_snapshot(path: Path) -> dict:
     raw = path.read_bytes()
-    data = json.loads(raw.decode("utf-8"))
-    normalize_config(data)
-    email = data.get('notifications', {}).get('email', {})
+    data = parse_config(raw, path)
+    settings = data.get("notifications", {})
+    if not isinstance(settings, dict) or not isinstance(settings.get("email", {}), dict):
+        raise ConfigError("notifications 和 notifications.email 必须是对象")
+    email = settings.get("email", {})
+    # Clients consume boolean switches. Expose malformed legacy switches as
+    # disabled so an unrelated edit cannot re-enable notifications on save.
+    for section, key in ((settings, "on_success"), (settings, "on_error"), (email, "enabled")):
+        if key in section and type(section[key]) is not bool:
+            section[key] = False
     email['has_authorization_code'] = bool(email.pop('authorization_code_encrypted', ''))
     email.pop('authorization_code', None)
     data["_revision"] = hashlib.sha256(raw).hexdigest()
@@ -111,6 +119,12 @@ class WebState:
         self.owned_devices = []
         self.cancel = threading.Event()
         self.logs: list[str] = []
+        self.log_stream = uuid.uuid4().hex
+        self.log_count = 0
+        self.report_version = uuid.uuid4().hex
+        self.plan_lock = threading.Lock()
+        self.plan_config_stamp = None
+        self.plan_runtime = {}
         self.result: dict | None = None
         self.last_result: dict | None = None
         try:
@@ -171,10 +185,49 @@ class WebState:
     def log(self, message: str) -> None:
         with self.lock:
             self.logs.append(message)
+            self.log_count += 1
             if len(self.logs) > 300:
                 del self.logs[:-300]
 
+    def status_delta(self, query: dict) -> dict:
+        with self.lock:
+            cursor = int(query.get("cursor", ["0"])[0])
+            first = self.log_count - len(self.logs)
+            reset = query.get("stream") != [self.log_stream] or not first <= cursor <= self.log_count
+            snapshot = {"running": self.running, "stream": self.log_stream, "cursor": self.log_count,
+                        "logs_reset": reset, "logs": self.logs[:] if reset else self.logs[cursor-first:],
+                        "report_version": self.report_version}
+            if query.get("report") != [self.report_version]:
+                snapshot["report"] = self.last_result if self.running else (self.result or self.last_result)
+        return snapshot
+
+    def plan_version(self) -> str:
+        def stamp(path: Path):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return None
+            return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+        with self.plan_lock:
+            config_stamp = stamp(self.config_path)
+            if self.plan_config_stamp != config_stamp:
+                self.plan_runtime = load_config(self.config_path).get("runtime", {})
+                self.plan_config_stamp = config_stamp
+            day = execution_day(self.plan_runtime, datetime.now()).isoformat()
+            folder = self.config_path.parent
+            return repr((day, config_stamp, stamp(folder / "state.json"), stamp(folder / ".daily-attempts" / day)))
+
     def start_run(self, tasks: list[str] | None, force: bool) -> None:
+        if not isinstance(force, bool):
+            raise ValueError("force 必须是布尔值 true 或 false")
+        config = load_config(self.config_path)
+        if tasks is not None:
+            if not isinstance(tasks, list) or not tasks or not all(isinstance(t, str) and t.strip() for t in tasks):
+                raise ValueError("请提供非空的任务 ID 列表")
+            unknown = set(tasks).difference(t["id"] for t in config["tasks"])
+            if unknown:
+                raise ValueError("未知任务 ID：" + "、".join(sorted(unknown)))
         with self.lock:
             if self.closing.is_set():
                 raise RuntimeError("助手正在关闭")
@@ -184,17 +237,19 @@ class WebState:
             self.last_screenshot = None
             self.cancel = threading.Event()
             self.logs = []
+            self.log_stream = uuid.uuid4().hex
+            self.log_count = 0
+            self.report_version = uuid.uuid4().hex
             self.result = None
 
         def worker() -> None:
             device = None
             close_after_run = False
             try:
-                config = load_config(self.config_path)
                 close_after_run = config.get("runtime", {}).get("close_tool_after_run", False)
                 device = AdbDevice(config["emulator"])
                 result = TaskRunner(config, self.config_path, log=self.log, cancel=self.cancel, device=device).run(
-                    task_ids=set(tasks) if tasks else None, force=force)
+                    task_ids=set(tasks) if tasks is not None else None, force=force)
                 with self.lock:
                     self.result = result
                     if result.get("status") != "nothing_to_do":
@@ -207,6 +262,7 @@ class WebState:
             finally:
                 with self.lock:
                     self.running = False
+                    self.report_version = uuid.uuid4().hex
                     self.last_screenshot = None
                     self.owned_devices = [item for item in self.owned_devices if item.owns_live_emulator()]
                     if device and device.owns_live_emulator():
@@ -305,9 +361,18 @@ def serve(config_path: Path, port: int = 8765, *, fallback_port: bool = False,
                 if route == "/api/task-presets":
                     return self._json(task_presets())
                 if route == "/api/plan":
+                    version = state.plan_version()
                     runner = TaskRunner(load_config(config_path), config_path)
-                    return self._json({"date": runner.today.isoformat(), "items": runner.preview()})
+                    return self._json({"date": runner.today.isoformat(), "items": runner.preview(), "version": version})
                 if route == "/api/status":
+                    query = parse_qs(urlparse(self.path).query)
+                    if "delta" in query:
+                        snapshot = state.status_delta(query)
+                        try:
+                            snapshot["plan_version"] = state.plan_version()
+                        except (ConfigError, OSError, ValueError) as exc:
+                            snapshot["plan_error"] = str(exc)
+                        return self._json(snapshot)
                     with state.lock:
                         snapshot = {"running": state.running, "logs": list(state.logs),
                                     "result": state.result, "last_result": state.last_result}
@@ -362,7 +427,7 @@ def serve(config_path: Path, port: int = 8765, *, fallback_port: bool = False,
                     return self._json({"ok": True, "reset_count": reset_count})
                 if route == "/api/run":
                     with state.device_lock:
-                        state.start_run(data.get("tasks"), bool(data.get("force", False)))
+                        state.start_run(data.get("tasks"), data.get("force", False))
                     return self._json({"ok": True})
                 if route == "/api/stop":
                     state.cancel.set()

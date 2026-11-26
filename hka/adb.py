@@ -20,6 +20,10 @@ class AdbTransportError(AdbError):
     pass
 
 
+class AdbInputDenied(AdbError):
+    """Android denied input injection; other task inputs would fail too."""
+
+
 def _background_options() -> dict:
     # pythonw otherwise gives each console helper its own visible window.
     return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
@@ -176,22 +180,31 @@ class AdbDevice:
         matches = [index for index, pid in instances.items() if pid == process_id]
         return matches[0] if len(matches) == 1 else None
 
-    def connect(self, *, rediscover: bool = True) -> None:
+    @staticmethod
+    def _budget(limit: float, deadline: float | None) -> float:
+        if deadline is None:
+            return limit
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AdbError("设备操作已达到总时限")
+        return min(limit, remaining)
+
+    def connect(self, *, rediscover: bool = True, deadline: float | None = None) -> None:
         if rediscover and self._auto_serial:
-            self._refresh_mumu_address()
+            self._refresh_mumu_address(deadline)
             if self.serial.lower() in {"auto", "自动"}:
-                self.serial = self._detect_emulator()
+                self.serial = self._detect_emulator(deadline)
         connect_message = ""
         if ":" in self.serial:
             try:
-                result = self._execute([self.adb_path, "connect", self.serial], 15)
+                result = self._execute([self.adb_path, "connect", self.serial], self._budget(15, deadline))
                 connect_message = (result.stdout + result.stderr).decode("utf-8", errors="replace").strip()
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise self._execution_error(exc) from exc
         for attempt in range(4):
             self._check_cancel()
             try:
-                state = self._run("get-state", timeout=5)
+                state = self._run("get-state", timeout=self._budget(5, deadline))
                 if state == "device":
                     return
                 if state == "offline":
@@ -203,14 +216,14 @@ class AdbDevice:
                     raise type(exc)(f"无法连接设备 {self.serial}: {exc}{detail}") from exc
                 # A connect response can precede transport readiness, especially
                 # after recovering a closed screenshot stream.
-                self._wait(0.5 * (attempt + 1))
+                self._wait(self._budget(0.5 * (attempt + 1), deadline))
 
-    def _refresh_mumu_address(self) -> None:
+    def _refresh_mumu_address(self, deadline: float | None = None) -> None:
         # MuMu can keep a stale ADB transport alive after its window has exited,
         # then assign a different port on launch. Only resolve an explicitly
         # configured instance; never guess between other connected emulators.
         executable = Path(self.emulator_path)
-        if executable.name.lower() != "mumumanager.exe" or not executable.is_file():
+        if executable.name.lower() != "mumumanager.exe":
             return
         if not (self.serial.lower() in {"auto", "自动"} or
                 self.serial.startswith(("127.0.0.1:", "localhost:", "emulator-"))):
@@ -223,27 +236,31 @@ class AdbDevice:
             if arg.startswith("--vmindex="):
                 index = arg.split("=", 1)[1]
                 break
+        if index is None and not any(arg in {"-v", "--vmindex"} for arg in self.emulator_args):
+            return
         if index is None or not index.isdigit():
-            return
+            raise AdbError("MuMu 实例编号无效")
         try:
-            result = self._execute([str(executable), "info", "-v", index], 10)
+            result = self._execute([str(executable), "info", "-v", index], self._budget(10, deadline))
             if result.returncode:
-                return
+                raise AdbError(f"无法确认 MuMu 实例 {index}，未选择其他设备")
             info = json.loads(result.stdout.decode("utf-8-sig"))
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            raise AdbError(f"无法读取 MuMu 实例 {index} 的设备信息") from exc
         if not isinstance(info, dict) or str(info.get("index")) != index:
-            return
+            raise AdbError(f"MuMu 返回的实例与配置 {index} 不符")
         if info.get("is_process_started") is False or info.get("is_android_started") is False:
-            raise AdbError(f"MuMu 实例 {index} 尚未启动完成，旧 ADB 地址可能仍显示在线，请启动该实例后重试")
+            raise AdbTransportError(f"MuMu 实例 {index} 尚未启动完成")
         port = info.get("adb_port")
         host = info.get("adb_host_ip", "127.0.0.1")
         if type(port) is int and 0 < port < 65536 and host in {"127.0.0.1", "localhost"}:
             self.serial = f"{host}:{port}"
+        else:
+            raise AdbError(f"MuMu 实例 {index} 未提供有效的本地 ADB 地址")
 
-    def _detect_emulator(self) -> str:
+    def _detect_emulator(self, deadline: float | None = None) -> str:
         try:
-            result = self._execute([self.adb_path, "devices"], 15)
+            result = self._execute([self.adb_path, "devices"], self._budget(15, deadline))
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise self._execution_error(exc) from exc
         if result.returncode:
@@ -258,40 +275,48 @@ class AdbDevice:
             return devices[0]
         if devices:
             raise AdbError("检测到多个模拟器，请填写要使用的设备地址: " + "、".join(devices))
-        raise AdbError("未检测到已连接的模拟器，请开启模拟器 ADB 调试，并填写模拟器设置中显示的实际 ADB 地址")
+        raise AdbTransportError("未检测到已连接的模拟器，请开启模拟器 ADB 调试，并填写模拟器设置中显示的实际 ADB 地址")
 
     def wait_until_ready(self, timeout: float = 120) -> None:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                self.connect()
-                return
+                self.connect(deadline=deadline)
+                if self._package_manager_ready(deadline):
+                    return
+                last_error = AdbError("Android 包管理器尚未就绪")
             except AdbError as exc:
                 last_error = exc
-                self._wait(min(2, max(0.1, deadline - time.monotonic())))
+            self._wait(min(2, max(0, deadline - time.monotonic())))
         raise AdbError(f"模拟器启动超时: {last_error}")
+
+    def _package_manager_ready(self, deadline: float | None = None) -> bool:
+        output = self._run("shell", "pm", "path", "android", timeout=self._budget(5, deadline))
+        return any(line.startswith("package:") for line in output.splitlines())
 
     def screen(self, *, recover_transport: bool = True) -> bytes:
         errors = []
         transport_failed = False
         fallback = ("shell", "-T", "screencap", "-p")
         alternative = fallback if self._screenshot_command[0] == "exec-out" else ("exec-out", "screencap", "-p")
-        for attempt, command in enumerate((self._screenshot_command, alternative, self._screenshot_command)):
+        deadline = time.monotonic() + 30
+        reset_transport = False
+        for command in (self._screenshot_command, alternative, self._screenshot_command):
             self._check_cancel()
+            if time.monotonic() >= deadline:
+                break
             try:
-                if attempt == 1:
+                if reset_transport:
                     # Reset this device's transport only, keeping other emulators
                     # and tools using the shared ADB server connected.
                     if ":" in self.serial:
-                        self._execute([self.adb_path, "disconnect", self.serial], 5)
+                        self._execute([self.adb_path, "disconnect", self.serial], self._budget(5, deadline))
                     else:
-                        self._run("reconnect", timeout=5)
-                    self.connect(rediscover=False)
-                elif attempt == 2:
-                    self._wait(1)
-                    self.connect(rediscover=False)
-                data = self._run(*command, timeout=10, binary=True)
+                        self._run("reconnect", timeout=self._budget(5, deadline))
+                    self.connect(rediscover=False, deadline=deadline)
+                    reset_transport = False
+                data = self._run(*command, timeout=self._budget(10, deadline), binary=True)
                 self._validate_screenshot(data)
                 self._screenshot_command = command
                 return data
@@ -300,9 +325,10 @@ class AdbDevice:
                     if not recover_transport:
                         raise
                     transport_failed = True
+                    reset_transport = True
                 errors.append(str(exc))
         error_type = AdbTransportError if transport_failed else AdbError
-        raise error_type(f"模拟器截图失败（{self.serial}），重连及备用截图均未恢复。"
+        raise error_type(f"模拟器截图失败（{self.serial}），限定次数和时间内未恢复。"
                        "请确认对应模拟器已启动并能正常显示画面，必要时重启该实例后重试。详情: "
                        + "；".join(errors))
 
@@ -344,7 +370,7 @@ class AdbDevice:
             if "INJECT_EVENTS" not in str(exc):
                 raise
             # Never replay an input that may already have partially executed.
-            raise AdbError(
+            raise AdbInputDenied(
                 f"模拟器拒绝{action}输入（INJECT_EVENTS），本轮已停止。"
                 "请重启模拟器后重试；如果仍失败，请检查模拟器的 ADB 输入授权。"
                 f"原始错误: {exc}"
@@ -383,4 +409,8 @@ class AdbDevice:
 
     def installed(self) -> bool:
         output = self._run("shell", "pm", "path", self.package)
-        return "package:" in output
+        if any(line.startswith("package:") for line in output.splitlines()):
+            return True
+        if not self._package_manager_ready():
+            raise AdbError("Android 包管理器尚未就绪，无法确认游戏安装状态")
+        return False

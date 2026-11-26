@@ -17,7 +17,7 @@ class Scenario:
         self.cost = initial_cost
         self.battles = []
         self.toggle_works = True
-        runner = SimpleNamespace(device=Mock(), log=Mock(), sleep=Mock())
+        runner = SimpleNamespace(device=Mock(), log=Mock(), sleep=Mock(), _task_details={})
         self.flow = GameFlows(runner)
         self.flow._activity = Mock()
         self.flow._home = Mock()
@@ -112,6 +112,13 @@ class BonusTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unconfirmed map"):
             case.run(15)
         self.assertEqual(case.battles, [100])
+
+    def test_failed_second_battle_preserves_first_settlement(self):
+        case = Scenario(250, 50)
+        case.flow._combat.side_effect = [None, RuntimeError("未确认结算")]
+        with self.assertRaisesRegex(RuntimeError, "未确认结算"):
+            case.run(15)
+        self.assertEqual(case.flow.runner._task_details["stamina_farm"]["runs"], 1)
 
     def test_extra_after_confirmed_settlement(self):
         case = Scenario(100, 50)

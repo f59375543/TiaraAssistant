@@ -83,36 +83,8 @@
       },
       "steps": [
         {
-          "type": "repeat",
-          "times": 6,
-          "steps": [
-            {
-              "type": "tap_image",
-              "image": "popup_close.png",
-              "region": [
-                0.65,
-                0.08,
-                0.95,
-                0.5
-              ],
-              "timeout": 2,
-              "on_missing": "break_repeat",
-              "wait": 0.7
-            }
-          ]
-        },
-        {
-          "type": "tap_image",
-          "image": "announcement_close.png",
-          "region": [
-            0.8,
-            0,
-            1,
-            0.25
-          ],
-          "timeout": 3,
-          "on_missing": "continue",
-          "wait": 0.7
+          "type": "game_flow",
+          "flow": "dismiss_login_popups"
         }
       ],
       "frequency": "every_run"

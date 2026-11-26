@@ -87,6 +87,12 @@ class RunReportingTests(unittest.TestCase):
         (folder / "run_20260103.json").write_text("not json")
         self.assertEqual(load_latest_report(folder), old)
 
+        for fields in ({"tasks": [None]}, {"tasks": [{"id": "first", "status": []}]},
+                       {"not_run": "invalid"}, {"not_run": [None]}):
+            with self.subTest(fields=fields):
+                (folder / "run_20260104.json").write_text(json.dumps({**old, **fields}))
+                self.assertEqual(load_latest_report(folder), old)
+
     def test_daemon_continues_after_busy_run(self):
         self.path.write_text(json.dumps(self.config))
         starts = [datetime(2026, 1, day, 7, 29) for day in (5, 6)]

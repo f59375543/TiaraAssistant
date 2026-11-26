@@ -64,10 +64,25 @@ class CombatEntryTests(unittest.TestCase):
         flow._tap.assert_not_called()
         flow._swipe.assert_not_called()
 
+    def test_unknown_screen_after_combat_entry_suspends_inputs(self):
+        flow = self.flow([[hit("HP 10/10", 20, 20)]] + [[hit("网络正在重连")]] * 4)
+        with self.assertRaisesRegex(RuntimeError, "连接提示"):
+            flow._combat({})
+        flow._tap.assert_called_once_with(1480, 565, .1)
+        flow._swipe.assert_not_called()
+
+    def test_background_health_bar_does_not_override_reconnect_prompt(self):
+        flow = self.flow([[hit("HP 10/10", 20, 20), hit("网络连接中断")]])
+        with self.assertRaisesRegex(RuntimeError, "连接提示"):
+            flow._combat({})
+        flow._tap.assert_not_called()
+        flow._swipe.assert_not_called()
+
     def test_waits_for_hud_then_fights_and_settles(self):
         result = [hit("战斗结算", 800, 150), hit("确定", 800, 760), hit("再次挑战", 1000, 760)]
         stage_map = [hit("首页", 780, 100), hit("战斗", 950, 100)]
-        flow = self.flow([[], [hit("HP 10/10", 20, 20)], result, stage_map, stage_map])
+        hud = [hit("HP 10/10", 20, 20)]
+        flow = self.flow([[], hud, hud, result, stage_map, stage_map])
         flow._combat({})
         self.assertEqual(flow._tap.call_args_list, [call(1480, 565, .1), call(810, 770, 1.0)])
         flow._swipe.assert_called_once()
@@ -155,13 +170,22 @@ class QuickBattleTests(unittest.TestCase):
 
     def test_adjust_count_then_confirm_and_settle(self):
         button = hit("确定", 680, 560)
-        result = [hit("战斗结算", 780, 160), hit("确定", 850, 760)]
+        result = [hit("战斗结算", 780, 160), hit("第1次快捷战斗结果", 700, 280), hit("确定", 850, 760)]
+        stage_map = [hit("使魔的爱", 670, 300), hit("虚轴之庭", 1100, 300)]
         flow = self.flow([self.dialog(3, 10), self.dialog(2, 40), self.dialog(1, 70),
-                          self.dialog(1, 70, [button]), result])
+                          self.dialog(1, 70, [button]), result, stage_map])
         self.assertEqual(flow._execute_quick("使魔的爱", 1), 1)
         flow._click.assert_called_once_with("快捷战斗", (1040, 740, 1440, 870))
         self.assertEqual(flow._tap.call_args_list, [call(641, 492), call(641, 492),
                                                    call(690, 570), call(860, 770)])
+
+    def test_quick_result_must_close_after_one_confirmation(self):
+        button = hit("确定", 680, 560)
+        result = [hit("战斗结算", 780, 160), hit("第1次快捷战斗结果", 700, 280), hit("确定", 850, 760)]
+        flow = self.flow([self.dialog(1, 70, [button])] + [result] * 9)
+        with self.assertRaisesRegex(RuntimeError, "未确认已离开结算页"):
+            flow._execute_quick("使魔的爱", 1)
+        self.assertEqual(flow._tap.call_count, 2)
 
 
 if __name__ == "__main__":

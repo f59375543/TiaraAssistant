@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .combat import upgrade_combat_controls
-from .defaults import DEFAULT_CONFIG, DEFAULT_LAUNCH_STEPS
+from .defaults import DEFAULT_CONFIG, DEFAULT_LAUNCH_STEPS, LEGACY_POPUP_STEPS
+from .notify import validate_notifications
 
 
 class ConfigError(ValueError):
@@ -16,16 +17,26 @@ class ConfigError(ValueError):
 
 
 ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
-STEP_TYPES = {"launch_game", "wait_image", "tap_image", "tap", "swipe", "key", "sleep", "screenshot", "repeat", "if_image", "game_flow"}
+STEP_TYPES = ("launch_game", "wait_image", "tap_image", "tap", "swipe", "key", "sleep", "screenshot", "repeat", "if_image", "game_flow")
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
     path = Path(path).resolve()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
         raise ConfigError(f"无法读取配置 {path}: {exc}") from exc
-    normalize_config(data)
+    return parse_config(raw, path)
+
+
+def parse_config(raw: bytes, path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"配置文件 {path} 需要使用 UTF-8 编码") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"无法读取配置 {path}: {exc}") from exc
+    normalize_config(data, config_dir=path.parent)
     return data
 
 
@@ -40,7 +51,8 @@ def task_frequency(task: dict[str, Any]) -> str:
     return "once_per_day"
 
 
-def normalize_config(data: dict[str, Any], *, migrate_task_list: bool = True) -> None:
+def normalize_config(data: dict[str, Any], *, migrate_task_list: bool = True,
+                     config_dir: Path | None = None) -> None:
     upgrade_legacy_mail(data)
     if migrate_task_list and isinstance(data, dict) and not data.get("guild_daily_migrated"):
         upgrade_guild_daily(data)
@@ -51,6 +63,10 @@ def normalize_config(data: dict[str, Any], *, migrate_task_list: bool = True) ->
         runtime["run_dir"] = "logs"
     data["guild_daily_migrated"] = True
     for task in data["tasks"]:
+        if config_dir is not None and task["id"] == "dismiss_popups" and task["steps"] == LEGACY_POPUP_STEPS:
+            templates = config_dir / runtime.get("template_dir", "templates")
+            if not any((templates / name).is_file() for name in ("popup_close.png", "announcement_close.png")):
+                task["steps"] = [{"type": "game_flow", "flow": "dismiss_login_popups"}]
         if task["id"] == "launch" and task["steps"] == DEFAULT_LAUNCH_STEPS:
             task.setdefault("required", True)
         task["frequency"] = task_frequency(task)
@@ -117,8 +133,9 @@ def upgrade_guild_daily(data: Any) -> None:
 def save_config(path: str | Path, data: dict[str, Any]) -> None:
     data = copy.deepcopy(data)
     # A save explicitly replaces the task list, including intentional deletions.
-    normalize_config(data, migrate_task_list=False)
     path = Path(path).resolve()
+    normalize_config(data, migrate_task_list=False, config_dir=path.parent)
+    validate_notifications(data.get("notifications", {}))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -136,14 +153,20 @@ def validate_config(data: Any) -> None:
             raise ConfigError(f"emulator.{field} 必须是非空字符串")
     if not isinstance(emulator.get("arguments", []), list) or not all(isinstance(a, str) for a in emulator.get("arguments", [])):
         raise ConfigError("emulator.arguments 必须是字符串数组")
+    if type(emulator.get("stop_after_run", False)) is not bool:
+        raise ConfigError("emulator.stop_after_run 必须是布尔值")
     launch_delay = emulator.get("launch_delay", 10)
     if not isinstance(launch_delay, (int, float)) or not 0 <= launch_delay <= 300:
         raise ConfigError("emulator.launch_delay 必须在 0 到 300 秒之间")
     runtime = data.get("runtime", {})
     if not isinstance(runtime, dict):
         raise ConfigError("runtime 必须是对象")
-    if not isinstance(runtime.get("close_tool_after_run", False), bool):
-        raise ConfigError("runtime.close_tool_after_run 必须是布尔值")
+    for flag in ("close_tool_after_run", "stop_on_error", "scheduler_enabled"):
+        if type(runtime.get(flag, False)) is not bool:
+            raise ConfigError(f"runtime.{flag} 必须是布尔值")
+    for field in ("template_dir", "run_dir"):
+        if field in runtime and (not isinstance(runtime[field], str) or not runtime[field].strip()):
+            raise ConfigError(f"runtime.{field} 必须是非空路径")
     image_timeout = runtime.get("image_timeout", 12)
     if not isinstance(image_timeout, (int, float)) or not 0 <= image_timeout <= 300:
         raise ConfigError("runtime.image_timeout 必须在 0 到 300 秒之间")
@@ -185,7 +208,7 @@ def validate_config(data: Any) -> None:
 
 
 def validate_schedule(schedule: Any, location: str) -> None:
-    if not isinstance(schedule, dict) or schedule.get("type") not in {"every_run", "daily", "once_per_day", "weekdays", "dates", "range"}:
+    if not isinstance(schedule, dict) or schedule.get("type") not in ("every_run", "daily", "once_per_day", "weekdays", "dates", "range"):
         raise ConfigError(f"{location}.schedule.type 必须是 every_run/daily/once_per_day/weekdays/dates/range")
     kind = schedule["type"]
     if kind == "weekdays":
@@ -237,7 +260,7 @@ def execution_day(runtime: dict[str, Any], now: datetime) -> date:
     return (now - timedelta(days=1)).date() if now.strftime("%H:%M") < reset else now.date()
 
 
-def validate_steps(steps: Any, location: str) -> None:
+def validate_steps(steps: Any, location: str, *, in_repeat: bool = False) -> None:
     if not isinstance(steps, list):
         raise ConfigError(f"{location} 必须是数组")
     for index, step in enumerate(steps):
@@ -246,14 +269,17 @@ def validate_steps(steps: Any, location: str) -> None:
             raise ConfigError(f"{where}.type 无效")
         kind = step["type"]
         if kind == "game_flow":
-            if step.get("flow") not in {"enter_game", "claim_login_rewards", "claim_mail", "claim_guild_daily", "refresh_resonance", "free_gift", "quick_battle", "stamina_farm", "expeditions", "claim_presence", "claim_weekly", "bonus_double_stamina"}:
+            if step.get("flow") not in ("enter_game", "dismiss_login_popups", "claim_login_rewards", "claim_mail", "claim_guild_daily", "refresh_resonance", "free_gift", "quick_battle", "stamina_farm", "expeditions", "claim_presence", "claim_weekly", "bonus_double_stamina"):
                 raise ConfigError(f"{where}.flow 无效")
             options = step.get("options", {})
             if not isinstance(options, dict):
                 raise ConfigError(f"{where}.options 必须是对象")
-            if step["flow"] == "quick_battle" and options.get("stage", "使魔的爱") not in {"使魔的爱", "虚轴之庭"}:
+            if step["flow"] == "quick_battle" and options.get("stage", "使魔的爱") not in ("使魔的爱", "虚轴之庭"):
                 raise ConfigError(f"{where}.options.stage 无效")
             if step["flow"] in {"stamina_farm", "bonus_double_stamina"}:
+                load_wait = options.get("load_wait", 8)
+                if type(load_wait) not in (int, float) or not 0 <= load_wait <= 3600:
+                    raise ConfigError(f"{where}.options.load_wait 必须是 0 到 3600 秒之间的数值")
                 max_runs = options.get("max_runs", 20)
                 minimum_runs = 0 if step["flow"] == "stamina_farm" else 1
                 if type(max_runs) is not int or not minimum_runs <= max_runs <= 30:
@@ -263,7 +289,7 @@ def validate_steps(steps: Any, location: str) -> None:
                 combat = options.get("combat", {})
                 if not isinstance(combat, dict):
                     raise ConfigError(f"{where}.options.combat 必须是对象")
-                if combat.get("mode", "move_shoot") not in {"move_shoot", "buttons"}:
+                if combat.get("mode", "move_shoot") not in ("move_shoot", "buttons"):
                     raise ConfigError(f"{where}.options.combat.mode 无效")
                 for name, default, low, high in (("max_cycles", 24, 1, 120), ("movement_ms", 6500, 100, 20000), ("hold_ms", 900, 100, 20000)):
                     if type(combat.get(name, default)) is not int or not low <= combat.get(name, default) <= high:
@@ -276,7 +302,7 @@ def validate_steps(steps: Any, location: str) -> None:
                     raise ConfigError(f"{where}.options.combat.weapons 只能包含装备槽 A/B/C")
                 controls = skills + list(weapons.values()) + ([combat["shoot"]] if "shoot" in combat else [])
                 for control in controls:
-                    if not isinstance(control, dict) or control.get("mode", "off") not in {"off", "tap", "hold", "once"}:
+                    if not isinstance(control, dict) or control.get("mode", "off") not in ("off", "tap", "hold", "once"):
                         raise ConfigError(f"{where} 战斗按键模式无效")
                     if any(type(control.get(axis)) is not int or not 0 <= control[axis] <= limit for axis, limit in (("x", 1600), ("y", 900))):
                         raise ConfigError(f"{where} 战斗按键坐标无效")
@@ -295,8 +321,10 @@ def validate_steps(steps: Any, location: str) -> None:
             region = step.get("region", [0, 0, 1, 1])
             if not isinstance(region, list) or len(region) != 4 or any(not isinstance(v, (int, float)) or not 0 <= v <= 1 for v in region) or region[0] >= region[2] or region[1] >= region[3]:
                 raise ConfigError(f"{where}.region 无效")
-            if step.get("on_missing", "fail") not in {"fail", "continue", "skip_task", "break_repeat"}:
+            if step.get("on_missing", "fail") not in ("fail", "continue", "skip_task", "break_repeat"):
                 raise ConfigError(f"{where}.on_missing 无效")
+            if step.get("on_missing") == "break_repeat" and (not in_repeat or kind == "if_image"):
+                raise ConfigError(f"{where}.on_missing 的 break_repeat 只适用于循环内的等待或点击图像步骤")
         if kind in {"tap", "swipe"}:
             keys = ("x", "y") if kind == "tap" else ("x1", "y1", "x2", "y2")
             if any(not isinstance(step.get(key), (int, float)) or not 0 <= step[key] <= 1 for key in keys):
@@ -304,9 +332,9 @@ def validate_steps(steps: Any, location: str) -> None:
         if kind == "repeat":
             if type(step.get("times")) is not int or not 1 <= step["times"] <= 100:
                 raise ConfigError(f"{where}.times 必须在 1 到 100 之间")
-            validate_steps(step.get("steps"), where + ".steps")
+            validate_steps(step.get("steps"), where + ".steps", in_repeat=True)
         if kind == "if_image":
-            validate_steps(step.get("then", []), where + ".then")
-            validate_steps(step.get("else", []), where + ".else")
+            validate_steps(step.get("then", []), where + ".then", in_repeat=in_repeat)
+            validate_steps(step.get("else", []), where + ".else", in_repeat=in_repeat)
         if kind == "sleep" and (not isinstance(step.get("seconds"), (int, float)) or not 0 <= step["seconds"] <= 3600):
             raise ConfigError(f"{where}.seconds 必须在 0 到 3600 之间")

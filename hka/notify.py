@@ -6,10 +6,46 @@ import re
 import ssl
 import smtplib
 import urllib.request
+from urllib.parse import urlsplit
 from email.message import EmailMessage
 from threading import Event
 from typing import Any
 from .mail_credentials import unprotect_secret
+
+
+def _webhook_url(item: Any) -> str | None:
+    if not isinstance(item, dict) or type(item.get("enabled", True)) is not bool:
+        raise ValueError("配置应包含 URL 和布尔开关")
+    if not item.get("enabled", True):
+        return None
+    url = item.get("url")
+    if not isinstance(url, str) or any(char.isspace() for char in url):
+        raise ValueError("URL 无效")
+    address = urlsplit(url)
+    if address.scheme not in {"https", "http"} or not address.hostname:
+        raise ValueError("URL 无效")
+    return url
+
+
+def validate_notifications(settings: Any) -> None:
+    if not isinstance(settings, dict):
+        raise ValueError("notifications 必须是对象")
+    for flag in ("on_success", "on_error"):
+        if type(settings.get(flag, True)) is not bool:
+            raise ValueError(f"notifications.{flag} 必须是布尔值")
+    hooks = settings.get("webhooks", [])
+    if not isinstance(hooks, list):
+        raise ValueError("notifications.webhooks 必须是数组")
+    for index, item in enumerate(hooks, 1):
+        try:
+            _webhook_url(item)
+        except ValueError as exc:
+            raise ValueError(f"Webhook {index} 配置无效") from exc
+    email = settings.get("email", {})
+    if not isinstance(email, dict) or type(email.get("enabled", False)) is not bool:
+        raise ValueError("notifications.email 必须是带布尔开关的对象")
+    if email.get("enabled"):
+        email_options(email)
 
 
 def email_options(settings: dict) -> dict:
@@ -55,29 +91,41 @@ def send_email(settings: dict, *, title: str, body: str) -> None:
 def send_notifications(config: dict[str, Any], *, success: bool, title: str, body: str,
                        cancel: Event | None = None) -> list[str]:
     settings = config.get("notifications", {})
-    if not settings.get("on_success" if success else "on_error", True):
+    if not isinstance(settings, dict):
+        return ["notifications 必须是对象"]
+    flag = "on_success" if success else "on_error"
+    enabled = settings.get(flag, True)
+    if type(enabled) is not bool:
+        return [f"notifications.{flag} 必须是布尔值，本次通知已跳过"]
+    if not enabled:
         return []
     errors: list[str] = []
-    for index, item in enumerate(settings.get("webhooks", [])):
-        if not item.get("enabled", True):
-            continue
+    hooks = settings.get("webhooks", [])
+    if not isinstance(hooks, list):
+        errors.append("Webhook 配置应为数组")
+        hooks = []
+    for index, item in enumerate(hooks):
         if cancel is not None and cancel.is_set():
             errors.append("运行已停止，剩余通知已跳过")
             return errors
-        url = item.get("url", "")
-        if not url.startswith(("https://", "http://")):
-            errors.append(f"Webhook {index + 1}: URL 无效")
-            continue
-        payload = json.dumps({"title": title, "content": body, "success": success}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
         try:
+            url = _webhook_url(item)
+            if url is None:
+                continue
+            payload = json.dumps({"title": title, "content": body, "success": success}, ensure_ascii=False).encode("utf-8")
+            request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
             with urllib.request.urlopen(request, timeout=10) as response:
                 if response.status >= 400:
                     raise RuntimeError(f"HTTP {response.status}")
         except Exception as exc:
             errors.append(f"Webhook {index + 1}: {exc}")
     email = settings.get("email", {})
-    if email.get("enabled"):
+    if not isinstance(email, dict):
+        errors.append("邮件通知配置应为对象")
+        return errors
+    if type(email.get("enabled", False)) is not bool:
+        errors.append("notifications.email.enabled 必须是布尔值，邮件通知已跳过")
+    elif email.get("enabled"):
         if cancel is not None and cancel.is_set():
             errors.append("运行已停止，邮件通知已跳过")
             return errors
