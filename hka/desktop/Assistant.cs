@@ -15,9 +15,9 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyTitle("蒂亚拉小助手")]
 [assembly: AssemblyProduct("蒂亚拉小助手")]
 [assembly: AssemblyDescription("崩坏学园2每日任务助手")]
-[assembly: AssemblyVersion("2026.11.26.0")]
-[assembly: AssemblyFileVersion("2026.11.26.0")]
-[assembly: AssemblyInformationalVersion("v2026.11.26")]
+[assembly: AssemblyVersion("2026.11.27.0")]
+[assembly: AssemblyFileVersion("2026.11.27.0")]
+[assembly: AssemblyInformationalVersion("v2026.11.27")]
 
 internal static class Program
 {

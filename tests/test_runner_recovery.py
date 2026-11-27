@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 from hka.adb import AdbDevice, AdbError, AdbTransportError
 from hka.cli import main
 from hka.defaults import DEFAULT_CONFIG
-from hka.runner import NavigationError, RunBusyError, TaskRunner
+from hka.runner import NavigationError, RunBusyError, SkipTask, TaskRunner
 
 
 class RunnerRecoveryTests(unittest.TestCase):
@@ -56,6 +56,16 @@ class RunnerRecoveryTests(unittest.TestCase):
             result = self.runner.run()
         self.assertEqual([(row["id"], row["status"]) for row in result["tasks"]], [("first", "failed"), ("pause", "success")])
         self.assertEqual([row["id"] for row in result["not_run"]], ["later"])
+
+    def test_only_skip_with_evidence_saves_its_decision_frame(self):
+        skips = [SkipTask("价格无法核实", decision_frame=b"dialog"), SkipTask("没有可领取奖励")]
+        with patch.object(self.runner, "_steps", side_effect=skips):
+            report = self.runner.run()
+        saved, ordinary = report["tasks"]
+        self.assertEqual((saved["status"], saved["screenshot_source"]), ("skipped", "decision"))
+        self.assertEqual((self.runner.run_dir / saved["screenshot"]).read_bytes(), b"dialog")
+        self.assertNotIn("screenshot", ordinary)
+        self.device.screen.assert_not_called()
 
     def test_independent_runners_contend_on_same_installation(self):
         other = TaskRunner(self.runner.config, self.path, device=self.device, log=Mock())

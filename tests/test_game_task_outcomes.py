@@ -1,5 +1,6 @@
 import io
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 from PIL import Image
 
@@ -78,7 +79,18 @@ class TaskOutcomeTests(unittest.TestCase):
         self.flow._hits = Mock(side_effect=[daily] + [daily + receipt] * 10)
         with self.assertRaisesRegex(RuntimeError, "未能核实"):
             self.flow.claim_presence({})
-        self.assertEqual(self.flow._tap.call_count, 2)
+        self.assertEqual(self.flow._tap.call_args_list, [call(1256, 264), call(712, 583, 1.0),
+                                                         call(1450, 740, 1.0)])
+
+    def test_persistent_compact_receipt_retries_backdrop_then_verifies_page(self):
+        daily = [hit("每日", 312, 208), hit("当前存在感,20/150", 1151, 201), hit("一键领取", 1236, 254)]
+        receipt = [TextHit("已领取以下奖励", .99, 668, 161, 281, 44),
+                   TextHit("(点击空白处关闭)", .99, 694, 577, 251, 37)]
+        self.flow._hits = Mock(side_effect=[daily, receipt, [], receipt, receipt, receipt, daily, daily])
+        self.flow.claim_presence({})
+        self.assertEqual(self.flow._tap.call_args_list, [call(1256, 264), call(819, 595, 1.0),
+                                                         call(1450, 740, 1.0)])
+        self.assertEqual(self.flow._hits.call_count, 8)
 
     def test_unrelated_notices_never_trigger_centered_receipt_dismissal(self):
         title = hit("已领取以下奖励", 668, 162)
@@ -100,14 +112,46 @@ class TaskOutcomeTests(unittest.TestCase):
         self.assertEqual(self.flow._tap.call_args_list, [call(712, 583, 1.0)] * 2)
 
     def test_dispatch_requires_increased_count(self):
+        self.flow.runner.last_decision_frame = b"team"
+        self.flow.runner._save_screenshot.side_effect = [Path("list.png"), Path("team.png")]
         self.flow._screen = Mock(return_value=b"frame")
         self.flow._scroll_expeditions = Mock(return_value=False)
         self.flow._read_region = Mock(side_effect=[[], [], [hit("点击选择使魔", 1250, 380)]])
         self.flow._hits = Mock(return_value=[hit("已接取的探险数2/10", 308, 176)])
         self.flow._text = Mock(return_value=hit("成功率", 1250, 175))
-        with self.assertRaisesRegex(RuntimeError, "未确认探险数增加"):
+        with self.assertRaisesRegex(RuntimeError, "出发前 2/10，出发后最后读数 2/10"):
             self.flow.expeditions({})
         self.assertEqual([c.args[0] for c in self.flow._click.call_args_list], ["一键派遣", "出发"])
+        evidence = self.flow.runner._task_details["expedition_dispatch"]
+        self.assertEqual((evidence["before"], evidence["after"], evidence["success_rate_text"]),
+                         ("2/10", "2/10", "成功率"))
+        self.assertEqual((evidence["list_screenshot"], evidence["team_screenshot"]), ("list.png", "team.png"))
+        self.assertEqual(self.flow.runner._save_screenshot.call_args_list,
+                         [call("expeditions_list", b"frame"), call("expeditions_team", b"team")])
+
+    def test_dispatch_count_reads_only_a_complete_header_fraction(self):
+        label = hit("已接取的探险数", 308, 176)
+        for words in ([label, hit("/10", 540, 176)], [label, hit("11/10", 540, 176)],
+                      [label, hit("3/10", 580, 370)]):
+            self.assertIsNone(self.flow._expedition_count(words))
+        self.assertEqual(self.flow._expedition_count([label, hit("3／10", 521, 169)]), (3, 10))
+        self.flow._read_region = Mock(return_value=[label, hit("3/10", 521, 169)])
+        self.assertEqual(self.flow._dispatch_count(b"frame", [label, hit("/10", 540, 176)]), (3, 10))
+        self.flow._read_region.assert_called_once_with(b"frame", (260, 156, 680, 233), 0.75)
+
+    def test_dispatch_verifies_increment_with_same_limit_and_stops_when_full(self):
+        near_cap = [hit("已接取的探险数9/10", 308, 176)]
+        full = [hit("已接取的探险数10/10", 308, 176)]
+        self.flow._screen = Mock(return_value=b"frame")
+        self.flow._scroll_expeditions = Mock(return_value=False)
+        self.flow._read_region = Mock(side_effect=[[], [], [hit("点击选择使魔", 1250, 380)]])
+        self.flow._hits = Mock(side_effect=[near_cap] * 5 + [[hit("已接取的探险数10/12", 308, 176)], full, full])
+        self.flow._text = Mock(return_value=hit("成功率80%", 1250, 175))
+        self.assertEqual(self.flow.expeditions({}), {"claimed": 0, "dispatched": 1})
+        self.assertEqual(self.flow._hits.call_count, 8)
+        self.assertEqual(self.flow.runner._task_details["expedition_dispatch"],
+                         {"before": "9/10", "after": "10/10", "success_rate_text": "成功率80%",
+                          "verification": "count_increased"})
 
     def test_popup_results_report_actual_count(self):
         png = io.BytesIO()
@@ -147,3 +191,49 @@ class TaskOutcomeTests(unittest.TestCase):
                                             [hit("剩余次数 1", 1100, 190)]])
         self.flow.refresh_resonance({})
         self.assertEqual(self.flow._tap.call_count, 2)
+
+    def test_last_free_refresh_switches_to_paid_price_without_another_submission(self):
+        self.flow._shop = Mock()
+        paid = [hit("消耗1零时之种", 1065, 158), hit("15小时49分后刷新", 1066, 197)]
+        dialog = [hit("你确定要进行免费刷新吗？", 528, 382), hit("确定", 615, 540)]
+        self.flow._hits = Mock(side_effect=[[hit("剩余次数1次", 1090, 164)], dialog, [], paid, paid])
+        self.flow.refresh_resonance({})
+        self.assertEqual(self.flow._tap.call_args_list, [call(1360, 190), call(635, 550, 1.0)])
+        evidence = self.flow.runner._task_details["refresh_resonance"]
+        self.assertEqual((evidence["before"], evidence["after"], evidence["after_label"]),
+                         (1, 0, "消耗1零时之种"))
+        self.flow._tap.reset_mock()
+        self.flow._hits = Mock(return_value=paid)
+        with self.assertRaisesRegex(SkipTask, "次数已用尽"):
+            self.flow.refresh_resonance({})
+        self.flow._tap.assert_not_called()
+
+    def test_unknown_or_inconsistent_refresh_result_stops_after_one_submission(self):
+        self.flow._shop = Mock()
+        paid = [hit("消耗1零时之种", 1065, 158)]
+        dialog = [hit("你确定要进行免费刷新吗？", 528, 382), hit("确定", 615, 540)]
+        for before, after in [(2, [paid] * 4), (1, [paid, [], paid, []]),
+                              (1, [[hit("15小时49分后刷新", 1066, 197)]] * 4)]:
+            with self.subTest(before=before, after=after):
+                self.flow._tap.reset_mock()
+                self.flow._hits = Mock(side_effect=[[hit(f"剩余次数{before}次", 1090, 164)], dialog, *after])
+                with self.assertRaisesRegex(RuntimeError, "无法确认刷新成功"):
+                    self.flow.refresh_resonance({})
+                self.assertEqual(self.flow._tap.call_count, 2)
+
+    def test_refresh_dialog_excludes_background_shop_labels(self):
+        self.flow._shop = Mock()
+        frame_hits = [hit("提示", 752, 291), hit("你确定要进行免费刷新吗？", 528, 382),
+                      hit("尼禄", 1102, 490), hit("确定", 615, 540), hit("取消", 883, 541),
+                      hit("x6000", 540, 617)]
+        counts = iter((3, 2))
+
+        def read_box(box):
+            if box == (1010, 145, 1410, 235):
+                return [hit(f"剩余次数 {next(counts)}次", 1100, 170)]
+            left, top, right, bottom = box
+            return [item for item in frame_hits if left <= item.x < right and top <= item.y < bottom]
+
+        self.flow._hits = Mock(side_effect=read_box)
+        self.flow.refresh_resonance({})
+        self.assertEqual(self.flow._tap.call_args_list, [call(1360, 190), call(635, 550, 1.0)])

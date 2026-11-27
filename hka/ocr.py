@@ -113,7 +113,35 @@ def double_stamina(hits: list[TextHit]) -> int | None:
     return _stamina_value(hits, doubled=True)
 
 
-def stage_labels(png: bytes) -> list[TextHit]:
+def map_page(png: bytes, hits: list[TextHit] | None = None) -> tuple[int, int] | None:
+    """Read the blue page counter above the scrolling chat in 1600×900 space."""
+    import cv2
+    import numpy as np
+
+    def unique_page(candidates):
+        pages = set()
+        for hit in candidates:
+            match = re.fullmatch(r"(\d{1,2})\s*/\s*(\d{1,2})", hit.text)
+            if match:
+                current, total = map(int, match.groups())
+                if 1 <= current <= total:
+                    pages.add((current, total))
+        return pages.pop() if len(pages) == 1 else None
+
+    if hits is None:
+        hits = read_text(png, (630 / 1600, 780 / 900, 970 / 1600, 890 / 900), min_score=0.6)
+    page = unique_page(h for h in hits if 755 <= h.x + h.width // 2 <= 845 and 790 <= h.y <= 850)
+    if page is not None:
+        return page
+    with Image.open(io.BytesIO(png)) as image:
+        footer = image.crop((742, 796, 858, 860)).convert("RGB")
+    hsv = cv2.cvtColor(np.asarray(footer), cv2.COLOR_RGB2HSV)
+    blue = cv2.inRange(hsv, (90, 130, 150), (110, 255, 255))
+    prepared = Image.fromarray(255 - blue).resize((348, 192)).convert("RGB")
+    return unique_page(_read_pixels(prepared, 0.75))
+
+
+def stage_labels(png: bytes, target: str | None = None) -> list[TextHit]:
     """Read orange stage numbers on a colorful map in 1600×900 space."""
     import cv2
     import numpy as np
@@ -122,9 +150,17 @@ def stage_labels(png: bytes) -> list[TextHit]:
         image = image.convert("RGB").resize((1600, 900))
         rgb = np.asarray(image)[190:760, 170:1450]
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    orange = cv2.inRange(hsv, (5, 130, 130), (30, 255, 255))
-    prepared = cv2.resize(255 - orange, None, fx=2, fy=2,
-                          interpolation=cv2.INTER_NEAREST)
-    hits = _read_pixels(Image.fromarray(prepared).convert("RGB"), 0.3)
-    return [TextHit(hit.text, hit.score, 170 + hit.x // 2, 190 + hit.y // 2,
-                    hit.width // 2, hit.height // 2) for hit in hits]
+    def read_orange(lower, upper):
+        orange = cv2.inRange(hsv, lower, upper)
+        prepared = cv2.resize(255 - orange, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+        hits = _read_pixels(Image.fromarray(prepared).convert("RGB"), 0.3)
+        return [TextHit(hit.text, hit.score, 170 + hit.x // 2, 190 + hit.y // 2,
+                        hit.width // 2, hit.height // 2) for hit in hits]
+
+    labels = read_orange((5, 130, 130), (30, 255, 255))
+    if target and not any(re.sub(r"\s+", "", h.text).upper() == target.upper() for h in labels):
+        # Orange artwork behind a caption can merge into its digits. Keep
+        # only the bright caption fill in a second pass for the missing name.
+        labels.extend(h for h in read_orange((7, 220, 240), (24, 255, 255))
+                      if re.sub(r"\s+", "", h.text).upper() == target.upper())
+    return labels

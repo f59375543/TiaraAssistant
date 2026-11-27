@@ -30,8 +30,8 @@ class LoginMailReceiptTests(unittest.TestCase):
 
     def test_dismisses_announcement_after_login_claim_then_verifies_return(self):
         flow = self.flow([self.daily, self.announcement, *[self.home] * 3])
-        with patch("hka.game_flows.find_image", side_effect=[
-                None, (1461, 95, 0.995), *[(810, 85, 1.0)] * 3]):
+        flow._navigation_card = Mock(side_effect=[("游戏公告", 1461, 95), None, None, None])
+        with patch("hka.game_flows.find_image", return_value=(810, 85, 1.0)):
             self.assertEqual(flow.claim_login_rewards({}), {"claimed": 1, "pages": ["每日签到"]})
         self.assertEqual(flow._tap.call_args_list, [call(1110, 635, 1), call(1461, 95, 1.0)])
 
@@ -41,6 +41,23 @@ class LoginMailReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "未确认领取结果"):
             flow.claim_login_rewards({})
         flow._tap.assert_called_once_with(1110, 635, 1)
+
+    def test_promotional_card_over_home_requires_fresh_verification(self):
+        for remaining, confirmed in (([self.home] * 3, True), ([[]] * 38, False)):
+            with self.subTest(confirmed=confirmed):
+                flow = self.flow([self.daily, self.home, *remaining])
+                promo = ("活动宣传卡片", 1296, 236)
+                flow._navigation_card = Mock(side_effect=[promo, None, None, None])
+                flow.dismiss_login_popups = Mock()
+                with patch("hka.game_flows.find_image", return_value=(810, 85, 1.0)):
+                    if confirmed:
+                        self.assertEqual(flow.claim_login_rewards({})["pages"], ["每日签到"])
+                        self.assertEqual(flow._screen.call_count, 5)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "未确认领取结果"):
+                            flow.claim_login_rewards({})
+                flow.dismiss_login_popups.assert_called_once_with({})
+                flow._tap.assert_called_once_with(1110, 635, 1)
 
     def test_mail_receipt_then_stable_inbox(self):
         receipt = [*self.dimmed, hit("领取成功", 725, 257)]
@@ -69,6 +86,7 @@ class LoginMailReceiptTests(unittest.TestCase):
         sequence = [[hit(name, 600, 270), *self.daily[1:]]
                     for name in ["周年连登", "周年连续登陆", "周年连续登录"]]
         flow = self.flow(sequence + [self.home] * 3)
+        flow._navigation_card = Mock(return_value=None)
         with patch("hka.game_flows.find_image", return_value=(810, 85, 1.0)):
             self.assertEqual(flow.claim_login_rewards({})["pages"], ["周年连续登录"])
         flow._tap.assert_called_once()

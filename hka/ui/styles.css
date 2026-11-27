@@ -52,6 +52,8 @@ main, .footer-inner { max-width: 1340px; margin: auto; padding: 28px clamp(16px,
 .heading, .card-heading, .footer-inner { justify-content: space-between; }
 .heading { margin-bottom: 21px; }
 .heading .sub { margin-top: 4px; }
+.home-actions { display: grid; grid-template-columns: auto auto; align-items: start; gap: 7px 9px; }
+.home-actions #reset-today { grid-column: 2; }
 .hint, .sub, .empty, .task-empty { color: var(--muted); font-size: 13px; }
 .card, .editor, .plan-card, .last-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 19px; min-width: 0; }
 .card + .card, .overview + .card { margin-top: 14px; }

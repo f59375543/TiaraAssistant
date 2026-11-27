@@ -1,13 +1,15 @@
 """Offline regression for BONUS stage entry, ticket switching and accounting."""
+import io
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hka.game_flows import GameFlows, LowBonusStamina
-from hka.ocr import TextHit
+from hka.ocr import TextHit, map_page
 from hka.runner import SkipTask
 
 
@@ -53,6 +55,57 @@ class Scenario:
 
 
 class BonusTest(unittest.TestCase):
+    def test_low_stamina_after_rewards_skips_before_opening_battle_picker(self):
+        case = Scenario(29, 50)
+        del case.flow._activity
+        with self.assertRaises(LowBonusStamina) as error:
+            case.flow.stamina_farm({"first_clear": False})
+        self.assertEqual(error.exception.balance, 29)
+        case.flow._home.assert_called_once_with()
+        case.flow._tap.assert_not_called()
+        case.flow._click.assert_not_called()
+
+    def test_map_page_reuses_legacy_footer_and_rejects_ambiguous_counters(self):
+        png = io.BytesIO()
+        Image.new("RGB", (1600, 900)).save(png, "PNG")
+        first = TextHit("1/2", .95, 760, 810, 80, 40)
+        second = TextHit("2/2", .95, 760, 810, 80, 40)
+        chat = TextHit("1/2", .95, 645, 841, 60, 35)
+        with patch("hka.ocr.read_text", return_value=[chat, second]), patch("hka.ocr._read_pixels") as blue:
+            self.assertEqual(map_page(png.getvalue()), (2, 2))
+            blue.assert_not_called()
+        with patch("hka.ocr._read_pixels", return_value=[first, second]):
+            self.assertIsNone(map_page(png.getvalue(), [chat]))
+            self.assertIsNone(map_page(png.getvalue(), [first, second]))
+
+    def test_optional_stage_requires_page_two_and_target_specific_ocr(self):
+        flow = Scenario(100, 50).flow
+        flow._screen = Mock(return_value=b"map")
+        target = TextHit("2-3", .99, 1270, 472, 75, 45)
+        with patch("hka.game_flows.stage_labels", return_value=[target]) as labels:
+            with patch("hka.game_flows.map_page", side_effect=[(1, 2), None, (2, 2)]):
+                self.assertTrue(flow._optional_stage_visible("2-3"))
+            self.assertEqual(labels.call_count, 3)
+            labels.assert_called_with(b"map", "2-3")
+            with patch("hka.game_flows.map_page", side_effect=[(2, 2), None, (2, 2), (2, 2)]):
+                self.assertFalse(flow._optional_stage_visible("2-4"))
+            with patch("hka.game_flows.map_page", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "未确认第二页"):
+                    flow._optional_stage_visible("2-4")
+
+    def test_stage_entry_uses_recovered_target_caption_and_checks_detail(self):
+        flow = Scenario(100, 50).flow
+        del flow._stage
+        flow._screen = Mock(return_value=b"map")
+        flow._tap = Mock()
+        flow._stage_detail_visible = Mock(return_value=True)
+        target = TextHit("2-3", .99, 1270, 472, 74, 45)
+        with patch("hka.game_flows.stage_labels", return_value=[target]) as labels:
+            flow._stage("2-3")
+            labels.assert_called_once_with(b"map", "2-3")
+        flow._tap.assert_called_once_with(1307, 582, 1.2)
+        flow._stage_detail_visible.assert_called_once_with("2-3")
+
     def test_boundaries_for_every_entry_and_initial_ticket_state(self):
         for task in (11, 12, 15):
             for balance in (49, 50, 51, 99, 100, 101):

@@ -21,7 +21,9 @@ from .vision import find_image, template_path, VisionError
 
 
 class SkipTask(Exception):
-    pass
+    def __init__(self, message: str = "", *, decision_frame: bytes | None = None):
+        super().__init__(message)
+        self.decision_frame = decision_frame
 
 
 class NavigationError(RuntimeError):
@@ -262,6 +264,7 @@ class TaskRunner:
                 task_start = time.monotonic()
                 started_at = datetime.now()
                 evidence: dict[str, str] = {}
+                skip_frame = None
                 try:
                     task_day = execution_day(self.config.get("runtime", {}), datetime.now())
                     schedule = task.get("schedule", {"type": "daily"})
@@ -288,6 +291,7 @@ class TaskRunner:
                     status, message = "cancelled", "执行中已停止，未确认完成"
                 except SkipTask as exc:
                     status, message = "skipped", str(exc)
+                    skip_frame = exc.decision_frame
                 except EquipmentFull as exc:
                     status, message = "failed", str(exc)
                     result['attention_required'] = {'code': 'equipment_full', 'message': message}
@@ -297,15 +301,16 @@ class TaskRunner:
                     blocked_navigation = isinstance(exc, (NavigationError, AdbInputDenied))
                 self._action_day = None
                 self._action_task = None
-                if status == "failed":
+                if status == "failed" or skip_frame is not None:
                     try:
-                        frame = self.last_decision_frame
-                        evidence["screenshot"] = self._save_screenshot(task["id"] + "_error", frame).name
+                        frame = self.last_decision_frame if status == "failed" else skip_frame
+                        suffix = "_error" if status == "failed" else "_skipped"
+                        evidence["screenshot"] = self._save_screenshot(task["id"] + suffix, frame).name
                         evidence["screenshot_source"] = "decision" if frame is not None else "after_error"
                         if result.get("attention_required"):
                             result["attention_required"]["screenshot"] = str(self.run_dir / evidence["screenshot"])
                     except Exception as screenshot_error:
-                        self.log(f"错误截图失败: {screenshot_error}")
+                        self.log(f"任务截图保存失败: {screenshot_error}")
                 result["tasks"].append({"id": task["id"], "name": task["name"], "status": status, "message": message,
                                         "started_at": started_at.isoformat(timespec="milliseconds"),
                                         "finished_at": datetime.now().isoformat(timespec="milliseconds"),

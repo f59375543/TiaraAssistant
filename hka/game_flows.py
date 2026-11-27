@@ -13,12 +13,16 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageStat
 
-from .ocr import TextHit, double_stamina, find_text, integer_after, read_stamina_hud, read_text, stage_labels, stamina
+from .ocr import TextHit, double_stamina, find_text, integer_after, map_page, read_stamina_hud, read_text, stage_labels, stamina
 from .adb import AdbError, AdbTransportError
 from .runner import NavigationError, SkipTask
 from .vision import ImageFrame, find_image
 from .inventory import check_equipment_capacity
 from .combat import weapon_controls
+from .expedition_cards import ExpeditionCard, freshly_running, parse_cards, selected_card
+
+
+_REWARD_RECEIPT_BACKDROP = (1450, 740)
 
 
 class LowBonusStamina(SkipTask):
@@ -118,25 +122,23 @@ class GameFlows:
         return True
 
     @staticmethod
-    def _combat_result_confirmation(hits: list[TextHit]) -> TextHit | None:
+    def _combat_result_header_visible(hits: list[TextHit]) -> bool:
         header = [hit for hit in hits if 680 <= hit.x <= 1000 and 120 <= hit.y <= 200]
-        if not find_text(header, "战斗结算"):
-            return None
-        return next((hit for hit in hits if 700 <= hit.x <= 1170 and 700 <= hit.y <= 825
-                     and hit.text.strip() == "确定"), None)
+        return find_text(header, "战斗结算") is not None
 
     def _verified_combat_result_button(self, hits: list[TextHit]) -> TextHit | None:
-        confirm = self._combat_result_confirmation(hits)
-        if not confirm:
+        confirm = [hit for hit in hits if 700 <= hit.x <= 1170 and 700 <= hit.y <= 825
+                   and hit.text.strip() == "确定"]
+        if len(confirm) != 1 or not self._combat_result_header_visible(hits):
             return None
         buttons = [hit for hit in hits if 700 <= hit.x <= 1170 and 730 <= hit.y <= 805]
-        quick_result = any(680 <= hit.x <= 1120 and 210 <= hit.y <= 720
+        quick_result = any(680 <= hit.x <= 1120 and 205 <= hit.y + hit.height // 2 <= 745
                            and re.search(r"第\s*\d+\s*次\s*快捷战斗结果", hit.text) for hit in hits)
         stats = [hit for hit in hits if 690 <= hit.x <= 1120 and 195 <= hit.y <= 310]
         scored_result = sum(find_text(stats, label) is not None
                             for label in ("挑战时间", "受击次数", "最大连击", "本次积分")) >= 3
         if quick_result or scored_result or find_text(buttons, "再次挑战"):
-            return confirm
+            return confirm[0]
         return None
 
     def _dismiss_combat_result(self, hits: list[TextHit]) -> bool:
@@ -153,7 +155,7 @@ class GameFlows:
         if rewards is None:
             return None
         if rewards.y < 150:
-            return 1450, 740
+            return _REWARD_RECEIPT_BACKDROP
         # Compact receipts place the title lower and label their own dismissal area.
         titles = [h for h in hits if re.sub(r"\s+", "", h.text) == "已领取以下奖励"]
         for title in titles:
@@ -166,6 +168,27 @@ class GameFlows:
                         and re.sub(r"\s+", "", hint.text).strip("()（）") == "点击空白处关闭"):
                     return x, hint.y + hint.height // 2
         return None
+
+    def _dismiss_closed_activity(self, hits: list[TextHit]) -> bool:
+        title = any(h.text.strip() == "不在活动时间内" and 610 <= h.x <= 760
+                    and 265 <= h.y <= 330 for h in hits)
+        if not title:
+            return False
+        body = "".join(h.text for h in hits if 500 <= h.x <= 1050 and 350 <= h.y <= 470)
+        buttons = [h for h in hits if 510 <= h.x <= 1050 and 505 <= h.y <= 600]
+        if ("不在活动时间内" not in body or "开放时间" not in body or len(buttons) != 1
+                or buttons[0].text.strip() != "确定" or not 710 <= buttons[0].x <= 840):
+            raise NavigationError("活动时间提示的正文或按钮未确认，已停止导航")
+        button = buttons[0]
+        self._tap(button.x + button.width // 2, button.y + button.height // 2, 0.8)
+        for _ in range(5):
+            page = self._hits()
+            tabs = [h for h in page if 35 <= h.x < 185 and 175 <= h.y < 490]
+            if not find_text(page, "不在活动时间内") and self._picker_tabs_visible(tabs):
+                self.log("已关闭活动时间提示并确认返回关卡列表")
+                return True
+            self.sleep(0.5)
+        raise NavigationError("关闭活动时间提示后未能确认返回关卡列表")
 
     def _dismiss_navigation_notice(self, hits: list[TextHit]) -> bool:
         close = self._reward_receipt_close_point(hits)
@@ -228,19 +251,61 @@ class GameFlows:
         self._tap(back[0], back[1], 1.5)
         return True
 
+    def _leave_hot_spring_guide(self, hits: list[TextHit], frame: ImageFrame) -> bool:
+        next_button = any(h.text.strip() == "下一条" and 1350 <= h.x <= 1510 and 700 <= h.y <= 800
+                          for h in hits)
+        if not next_button:
+            return False
+        page = any(re.fullmatch(r"[1-6]\s*[/／]\s*6", h.text.strip()) and
+                   1380 <= h.x <= 1510 and 640 <= h.y <= 710 for h in hits)
+        if not page or not self._hot_spring_map_title(hits):
+            raise NavigationError("出现下一条提示，未确认温泉活动教程，已停止导航")
+        back = find_image(frame, Path(__file__).parent / "assets", {
+            "image": "tutorial_back.png", "region": [0.01, 0.03, 0.10, 0.15], "threshold": 0.95})
+        if not back:
+            raise NavigationError("未识别温泉活动教程的返回箭头，已停止导航")
+        self._tap(back[0], back[1], 1.0)
+        for _ in range(5):
+            screen = self._hits()
+            if not find_text(screen, "下一条"):
+                tabs = [h for h in screen if 35 <= h.x < 185 and 175 <= h.y < 490]
+                nav = [h for h in screen if 750 <= h.x < 1010 and 70 <= h.y < 130]
+                if self._picker_tabs_visible(tabs) or (find_text(nav, "首页") and find_text(nav, "战斗")):
+                    self.log("已退出温泉活动教程并确认游戏导航")
+                    return True
+            self.sleep(0.5)
+        raise NavigationError("退出温泉活动教程后未确认游戏导航")
+
+    @staticmethod
+    def _hot_spring_map_title(hits: list[TextHit]) -> bool:
+        return any(h.text.strip() == "揭秘狐妖汤" and 1280 <= h.x < 1510 and 145 <= h.y < 225
+                   for h in hits)
+
     def _home(self) -> None:
         clicked_home = False
+        closed_result = False
         for _ in range(8):
             screenshot = self._screen()
             hits = self._hits(frame=screenshot)
+            frame = ImageFrame(screenshot)
+            if self._leave_hot_spring_guide(hits, frame):
+                continue
+            if self._combat_result_header_visible(hits):
+                if closed_result or not self._dismiss_combat_result(hits):
+                    self.sleep(0.5)
+                else:
+                    closed_result = True
+                continue
+            closed_result = False
+            if self._dismiss_closed_activity(hits):
+                continue
             modal = [h for h in hits if 300 <= h.x <= 1300 and 220 <= h.y <= 730]
             words = "".join(h.text for h in modal)
             if find_text(modal, "取消") and "体力" in words and any(
                     token in words for token in ("水晶", "钻石", "双倍体力", "将消耗")):
                 self._cancel_exchange(modal, "返回首页前关闭体力兑换提示")
                 continue
-            frame = ImageFrame(screenshot)
-            if (self._dismiss_combat_result(hits) or self._dismiss_navigation_notice(hits)
+            if (self._dismiss_navigation_notice(hits)
                     or self._dismiss_navigation_card(frame) or self._leave_maze_roster(hits, frame)):
                 continue
             hit = next((hit for hit in hits if "首页" in hit.text and
@@ -497,9 +562,15 @@ class GameFlows:
                     self.sleep(0.6)
                 continue
             home_tab = any(h.text.strip() == "首页" and 750 <= h.x <= 890 for h in top)
-            home_visible = home_tab and find_text(top, "战斗") and find_image(
-                screenshot, Path(__file__).parent / "assets",
-                {"image": "home_active.png", "region": [0.47, 0, 0.56, 0.15], "threshold": 0.94})
+            home_visible = False
+            if home_tab and find_text(top, "战斗"):
+                frame = ImageFrame(screenshot)
+                if self._navigation_card(frame):
+                    home_frames = 0
+                    self.dismiss_login_popups({})
+                    continue
+                home_visible = find_image(frame, Path(__file__).parent / "assets", {
+                    "image": "home_active.png", "region": [0.47, 0, 0.56, 0.15], "threshold": 0.94})
             home_frames = home_frames + 1 if home_visible else 0
             if home_frames >= 3:
                 if "wish" in birthday_actions and "claim" not in birthday_actions:
@@ -700,29 +771,55 @@ class GameFlows:
             raise RuntimeError("已提交社团奖励领取，但未能核实领取结果，请查看失败截图")
         raise RuntimeError("未确认社团奖励可领取，未提交领取")
 
+    @staticmethod
+    def _resonance_refresh_status(hits: list[TextHit]) -> tuple[int | None, str]:
+        # The free count and the paid price occupy the same heading, above
+        # a separate countdown to the next automatic shop refresh.
+        heading_hits = sorted((h for h in hits if 1010 <= h.x < 1330 and 145 <= h.y <= 193),
+                              key=lambda h: h.x)
+        heading = re.sub(r"\s+", "", "".join(h.text for h in heading_hits))
+        if heading == "消耗1零时之种":
+            return 0, heading
+        count = re.fullmatch(r"剩余次数[:：]?(\d+)次?", heading)
+        return (int(count[1]) if count else None), heading
+
     def refresh_resonance(self, options: dict[str, Any]) -> None:
         self._shop()
         self._click("崩坏屋", (1000, 175, 1450, 410))
         self._click("共鸣屋", (0, 240, 225, 520))
         hits = self._hits((1010, 145, 1410, 235))
-        remaining = integer_after(hits, "剩余次数")
-        if remaining is None or remaining <= 0:
-            raise SkipTask("共鸣屋免费刷新次数为零或无法识别，已跳过")
+        remaining, before_label = self._resonance_refresh_status(hits)
+        evidence = {"before": remaining, "before_label": before_label, "submitted": False}
+        self.runner._task_details["refresh_resonance"] = evidence
+        if remaining == 0:
+            raise SkipTask("共鸣屋免费刷新次数已用尽，已跳过")
+        if remaining is None:
+            raise SkipTask("共鸣屋免费刷新次数无法识别，已跳过")
         self.log(f"共鸣屋剩余刷新次数 {remaining}")
         self._tap(1360, 190)
-        dialog = self._hits((450, 220, 1150, 670))
+        # Keep the shop's item names and exchange prices outside the modal crop.
+        dialog = self._hits((500, 285, 1100, 610))
         body = "".join(h.text for h in dialog if h.text.strip() not in {"提示", "确认", "确定", "取消"})
         body = re.sub(r"[\s？?。！!]", "", body)
-        if not re.fullmatch(r"(?:是否|确定|确认)?(?:使用|进行|消耗)?(?:(?:一|1)次)?免费刷新(?:一次|商店|商品|共鸣屋)?(?:吗|么)?", body):
+        free_prompt = (r"(?:你确定要进行免费刷新吗|"
+                       r"(?:是否|确定|确认)?(?:使用|进行|消耗)?(?:(?:一|1)次)?免费刷新(?:一次|商店|商品|共鸣屋)?(?:吗|么)?)")
+        if not re.fullmatch(free_prompt, body):
             raise RuntimeError("未确认本次为免费刷新，未提交")
         buttons = [item for item in dialog if item.text.strip() == "确定" and item.y > 500]
         if len(buttons) != 1:
             raise RuntimeError("未找到唯一的免费刷新确认按钮")
         hit = buttons[0]
         self._tap(hit.x + hit.width // 2, hit.y + hit.height // 2, 1.0)
-        after = integer_after(self._hits((1010, 145, 1410, 235)), "剩余次数")
-        if after != remaining - 1:
-            raise RuntimeError("刷新后剩余次数未准确减少一次，无法确认刷新成功")
+        evidence["submitted"] = True
+        previous_label = None
+        for _ in range(4):
+            after, label = self._resonance_refresh_status(self._hits((1010, 145, 1410, 235)))
+            evidence.update(after=after, after_label=label)
+            if after == remaining - 1 and (label != "消耗1零时之种" or previous_label == label):
+                return
+            previous_label = label
+            self.sleep(0.5)
+        raise RuntimeError("刷新后剩余次数未准确减少一次，无法确认刷新成功")
 
     def free_gift(self, options: dict[str, Any]) -> None:
         self._shop()
@@ -767,6 +864,7 @@ class GameFlows:
                       if word == "取消" and 850 < hit.x < 1040 and 530 < hit.y < 610]
             if len(cancel) == 1:
                 button = cancel[0]
+                price_dialog = self.runner.last_decision_frame
                 self._tap(button.x + button.width // 2, button.y + button.height // 2, 0.9)
                 for _ in range(3):
                     shop = self._hits()
@@ -774,7 +872,7 @@ class GameFlows:
                                        and abs(hit.y - title.y) < 60 for hit in shop)
                     if (item_visible and find_text(shop, "吼美礼包")
                             and not find_text(shop, "是否购买") and not find_text(shop, "取消")):
-                        raise SkipTask("零时馈礼确认框未读到最终价格，已取消购买")
+                        raise SkipTask("零时馈礼确认框未读到最终价格，已取消购买", decision_frame=price_dialog)
                     self.sleep(0.4)
                 raise RuntimeError("零时馈礼未提交购买，取消后未确认已返回商品列表")
         if not price_labels or not all(zero_price.fullmatch(word) for word in price_labels):
@@ -789,23 +887,43 @@ class GameFlows:
             raise RuntimeError("未看到零时馈礼购买成功提示")
         self._tap(800, 555)
 
-    def _battle_picker(self) -> None:
+    def _battle_picker(self, *, require_bonus_stamina: bool = False) -> None:
         self._home()
+        if require_bonus_stamina:
+            self._bonus_stamina()
         self._tap(955, 70, 1.5)
         home_retries = 0
+        closed_spring_guide = False
+        tried_spring_tab = False
+        tried_spring_castle = False
         for _ in range(12):
             # The activity picker has three left-hand tabs. Its right-hand
             # artwork occupies the same coordinates as a stage map's reset
             # button, so a blind tap there may enter an unrelated activity.
             screenshot = self._screen()
             full = self._hits(frame=screenshot, score=0.6)
+            frame = ImageFrame(screenshot)
+            if self._leave_hot_spring_guide(full, frame):
+                closed_spring_guide = True
+                continue
+            if self._dismiss_closed_activity(full):
+                continue
             tabs = [hit for hit in full if 35 <= hit.x < 185 and 175 <= hit.y < 490]
             if not self._picker_tabs_visible(tabs):
                 tabs = self._read_region(screenshot, (35, 175, 185, 490), 0.6)
             if self._picker_tabs_visible(tabs):
                 return
             hits = [hit for hit in full if hit.score >= 0.75]
-            frame = ImageFrame(screenshot)
+            spring_map = self._hot_spring_map_title(hits)
+            if spring_map and closed_spring_guide and not tried_spring_tab:
+                nav = [h for h in hits if 900 <= h.x < 1010 and 70 <= h.y < 130]
+                battle = next((h for h in nav if h.text.strip() == "战斗"), None)
+                active = battle and find_image(frame, Path(__file__).parent / "assets", {
+                    "image": "battle_active.png", "region": [0.56, 0, 0.65, 0.15], "threshold": 0.95})
+                if active:
+                    tried_spring_tab = True
+                    self._tap(battle.x + battle.width // 2, battle.y + battle.height // 2, 1.5)
+                    continue
             if (self._dismiss_navigation_notice(hits) or self._dismiss_navigation_card(frame)
                     or self._leave_maze_roster(hits, frame)):
                 continue
@@ -815,7 +933,14 @@ class GameFlows:
                     "image": image, "region": [0.8, 0.16, 1, 0.28], "threshold": 0.94})
                 if reset:
                     break
-            if reset:
+            # Correlation can also find the white castle beneath a dark modal.
+            # Its white center must be lit before the map button can be used.
+            if reset and min(frame.pixels[reset[1], reset[0]]) >= 195:
+                if spring_map:
+                    if tried_spring_castle:
+                        self.sleep(0.5)
+                        continue
+                    tried_spring_castle = True
                 self._tap(reset[0], reset[1], 0.8)
                 continue
             home = find_image(frame, Path(__file__).parent / "assets", {
@@ -842,7 +967,11 @@ class GameFlows:
         for start, end in ((350, 650), (740, 440)):
             previous = None
             for attempt in range(9):
-                hits = self._hits((925, 180, 1535, 875), score=0.65)
+                screenshot = self._screen()
+                if self._dismiss_closed_activity(self._hits(frame=screenshot)):
+                    previous = None
+                    continue
+                hits = self._read_region(screenshot, (925, 180, 1535, 875), 0.65)
                 hit = find_text(hits, "多元裂缝")
                 if hit:
                     if hit.y < 210:
@@ -850,7 +979,10 @@ class GameFlows:
                         continue
                     self._tap(hit.x + hit.width // 2, hit.y + hit.height // 2, 1.0)
                     for _ in range(6):
-                        stages = self._hits((550, 150, 1535, 740), score=0.65)
+                        screenshot = self._screen()
+                        if self._dismiss_closed_activity(self._hits(frame=screenshot)):
+                            raise SkipTask("多元裂缝当前不在活动时间内")
+                        stages = self._read_region(screenshot, (550, 150, 1535, 740), 0.65)
                         if all(find_text(stages, name) is not None
                                for name in ("使魔的爱", "虚轴之庭")):
                             return
@@ -1011,7 +1143,7 @@ class GameFlows:
                 find_text(hits, "今日免费") is None and find_text(hits, "快捷战斗") is None)
 
     def _activity(self) -> None:
-        self._battle_picker()
+        self._battle_picker(require_bonus_stamina=True)
         self._click("活动", (35, 175, 185, 490))
         # The event artwork moves between releases; use the B difficulty tag and
         # its nearby remaining-time tag to identify a live activity card. Only
@@ -1080,7 +1212,7 @@ class GameFlows:
     def _stage(self, name: str) -> None:
         for _ in range(6):
             frame = self._screen()
-            hits = stage_labels(frame)
+            hits = stage_labels(frame, name)
             hit = next((h for h in hits if re.sub(r"\s+", "", h.text).upper() == name.upper()), None)
             if hit:
                 # Stage name is printed immediately above the stage icon.
@@ -1090,10 +1222,9 @@ class GameFlows:
                 self.sleep(0.8)
                 continue
             page = self._hits(frame=frame)
-            page_hit = next((h for h in page if 740 < h.x < 850 and h.y > 780 and
-                             re.fullmatch(r"\d+\s*/\s*\d+", h.text)), None)
-            if page_hit:
-                current, total = map(int, re.findall(r"\d+", page_hit.text))
+            page_number = map_page(frame, page)
+            if page_number:
+                current, total = page_number
                 stage_number = re.fullmatch(r"(\d+)-\d+", name)
                 target_page = total if name == "BONUS" else int(stage_number.group(1)) if stage_number else 1
                 if not 1 <= target_page <= total:
@@ -1461,9 +1592,9 @@ class GameFlows:
         missing_frames = 0
         for _ in range(5):
             frame = self._screen()
-            labels = {re.sub(r"\s+", "", h.text).upper() for h in stage_labels(frame)}
-            footer = read_text(frame, (630 / 1600, 780 / 900, 970 / 1600, 890 / 900), min_score=0.6)
-            on_page_two = any(re.fullmatch(r"2\s*/\s*[2-6]", h.text.strip()) for h in footer)
+            labels = {re.sub(r"\s+", "", h.text).upper() for h in stage_labels(frame, name)}
+            page = map_page(frame)
+            on_page_two = page is not None and page[0] == 2 and 2 <= page[1] <= 6
             if on_page_two and any(label == "BONUS" or re.fullmatch(r"2-\d+", label) for label in labels):
                 if name.upper() in labels:
                     self.log(f"第二页已出现 {name}，继续检查首通")
@@ -1509,9 +1640,23 @@ class GameFlows:
         return max(ImageStat.Stat(ImageChops.difference(before, after)).mean) >= 2
 
     @staticmethod
-    def _expedition_count(hits: list[TextHit]) -> int | None:
-        count = integer_after(hits, "已接取的探险数")
-        return count if count is not None else integer_after(hits, "已接收的探险数")
+    def _expedition_count(hits: list[TextHit]) -> tuple[int, int] | None:
+        header = sorted((h for h in hits if 260 <= h.x < 650 and 150 <= h.y < 215), key=lambda h: h.x)
+        text = re.sub(r"\s+", "", "".join(h.text for h in header))
+        match = re.fullmatch(r"[·•●・]*已接[取收]的探险数[:：]?(\d{1,2})[/／](\d{1,2})", text)
+        if match:
+            current, limit = map(int, match.groups())
+            if 0 <= current <= limit and limit > 0:
+                return current, limit
+        return None
+
+    def _dispatch_count(self, frame: bytes, page: list[TextHit]) -> tuple[int, int] | None:
+        if self._blocking_game_dialog(page):
+            return None
+        count = self._expedition_count(page)
+        if count is None and (find_text(page, "探险数") or find_text(page, "使魔探险将于")):
+            count = self._expedition_count(self._read_region(frame, (260, 156, 680, 233), 0.75))
+        return count
 
     def _expedition_page(self) -> tuple[bytes, list[TextHit]]:
         frame = self._screen()
@@ -1520,6 +1665,39 @@ class GameFlows:
                 self._expedition_count(page) is None and not find_text(page, "使魔探险将于")):
             raise NavigationError("未确认使魔探险列表，已停止滚动和派遣")
         return frame, page
+
+    def _rewind_expeditions(self) -> None:
+        for _ in range(60):
+            frame, _ = self._expedition_page()
+            if not self._scroll_expeditions(frame, towards_top=True):
+                return
+        raise RuntimeError("使魔探险列表未确认已返回顶部")
+
+    def _find_dispatched_expedition(self, target: ExpeditionCard, before: tuple[int, int],
+                                    evidence: dict[str, Any], started: float) -> bool:
+        self._rewind_expeditions()
+        at_bottom = False
+        for _ in range(60):
+            frame, page = self._expedition_page()
+            count = self._dispatch_count(frame, page)
+            if count is None:
+                return False
+            evidence["after"] = f"{count[0]}/{count[1]}"
+            if count == (before[0] + 1, before[1]):
+                evidence["verification"] = "count_increased"
+                return True
+            if count != before:
+                return False
+            cards = parse_cards(page)
+            match = freshly_running(cards, target, time.monotonic() - started)
+            if match:
+                evidence.update(verification="target_timer", remaining_seconds=match.remaining_seconds)
+                self.log(f"已在「{target.name}」卡片核实派遣后的剩余时间")
+                return True
+            if at_bottom or any(c.name == target.name and c.state == "selectable" for c in cards):
+                return False
+            at_bottom = not self._scroll_expeditions(frame)
+        return False
 
     def expeditions(self, options: dict[str, Any]) -> dict[str, int]:
         self._tasks("使魔探险")
@@ -1547,7 +1725,8 @@ class GameFlows:
                         self._tap(800, 740)
                         break
                     remaining = self._expedition_count(after)
-                    if accepted is not None and remaining is not None and remaining < accepted:
+                    if (accepted is not None and remaining is not None and
+                            remaining[1] == accepted[1] and remaining[0] < accepted[0]):
                         break
                     self.sleep(0.4)
                 else:
@@ -1563,37 +1742,65 @@ class GameFlows:
             raise RuntimeError("使魔探险领取扫描超过上限")
         self.log(f"使魔探险领取 {claimed} 份奖励")
         # Claiming scans down the whole list. Dispatch must begin at the top.
-        for _ in range(60):
-            frame, _ = self._expedition_page()
-            if not self._scroll_expeditions(frame, towards_top=True):
-                break
-        else:
-            raise RuntimeError("使魔探险列表未确认已返回顶部")
+        self._rewind_expeditions()
         dispatched = 0
         stationary = 0
         for _ in range(60):
             frame, page = self._expedition_page()
+            accepted = self._dispatch_count(frame, page)
+            if accepted is not None and accepted[0] == accepted[1]:
+                break
             hits = self._read_region(frame, (1120, 270, 1490, 875), 0.75)
             select = find_text(hits, "点击选择使魔")
             if select:
-                accepted = self._expedition_count(page)
                 if accepted is None:
                     raise RuntimeError("无法确认当前已接取的探险数，未派遣")
+                before, limit = accepted
+                evidence = {"before": f"{before}/{limit}", "after": None}
+                target = selected_card(parse_cards(page), select)
+                if target:
+                    evidence.update(mission=target.name, duration_seconds=target.duration_seconds)
+                self.runner._task_details["expedition_dispatch"] = evidence
                 self._tap(select.x + select.width // 2, select.y + select.height // 2)
                 self._click("一键派遣", (860, 730, 1200, 865))
                 success = self._text("成功率", (1200, 135, 1530, 285))
                 if success is None:
                     raise RuntimeError("一键派遣后未显示成功率")
+                evidence["success_rate_text"] = success.text
+                team_frame = self.runner.last_decision_frame
+                started = time.monotonic()
                 self._click("出发", (1180, 730, 1510, 865))
+                searched_list = False
                 for _ in range(6):
-                    if self._expedition_count(self._hits()) == accepted + 1:
+                    after_frame = self._screen()
+                    after = self._dispatch_count(after_frame, self._hits(frame=after_frame))
+                    if after is not None:
+                        evidence["after"] = f"{after[0]}/{after[1]}"
+                    if after == (before + 1, limit):
+                        evidence["verification"] = "count_increased"
                         break
                     self.sleep(0.5)
                 else:
-                    raise RuntimeError("已点击出发，未确认探险数增加，已停止后续派遣")
+                    if target is not None and after == accepted:
+                        searched_list = self._find_dispatched_expedition(target, accepted, evidence, started)
+                if after != (before + 1, limit) and not searched_list:
+                    # The runner saves the final screen. Keep the preceding evidence
+                    # as well when the observed count cannot confirm a dispatch.
+                    for label, snapshot in (("list", frame), ("team", team_frame)):
+                        if isinstance(snapshot, bytes):
+                            try:
+                                path = self.runner._save_screenshot("expeditions_" + label, snapshot)
+                                evidence[label + "_screenshot"] = path.name
+                            except OSError as exc:
+                                self.log(f"无法保存探险派遣截图：{exc}")
+                    observed = evidence["after"] or "未读到"
+                    raise RuntimeError(f"未核实探险派遣结果（出发前 {before}/{limit}，"
+                                       f"出发后最后读数 {observed}），已停止后续派遣")
                 dispatched += 1
                 progress["dispatched"] = dispatched
                 stationary = 0
+                if searched_list:
+                    self._rewind_expeditions()
                 continue
             stationary = 0 if self._scroll_expeditions(frame) else stationary + 1
             if stationary >= 2:
@@ -1633,15 +1840,22 @@ class GameFlows:
         else:
             raise RuntimeError(f"未确认{label}奖励页及其领取按钮，未提交领取")
         claimed = False
+        compact_frames = 0
+        retried_close = False
         stable = 0
         for _ in range(10):
             hits = self._hits()
             close = self._reward_receipt_close_point(hits)
+            compact_frames = compact_frames + 1 if close and close != _REWARD_RECEIPT_BACKDROP else 0
             if close is not None:
                 stable = 0
                 if not claimed:
                     claimed = True
                     self._tap(*close, 1.0)
+                elif compact_frames >= 3 and not retried_close:
+                    retried_close = True
+                    self.log("奖励回执仍在，点击面板外空白处关闭")
+                    self._tap(*_REWARD_RECEIPT_BACKDROP, 1.0)
                 else:
                     self.sleep(0.5)
                 continue

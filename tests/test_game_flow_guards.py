@@ -117,6 +117,7 @@ class LoginRewardTests(unittest.TestCase):
         flow = GameFlows(runner)
         flow._screen = Mock(return_value=b"screen")
         flow._hits = Mock(side_effect=frames)
+        flow._navigation_card = Mock(return_value=None)
         flow._tap = Mock()
         return flow
 
@@ -186,6 +187,24 @@ class QuickBattleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "未确认已离开结算页"):
             flow._execute_quick("使魔的爱", 1)
         self.assertEqual(flow._tap.call_count, 2)
+
+    def test_compact_quick_result_recovers_before_background_home(self):
+        home = [hit("首页", 790, 84), hit("战斗", 950, 84)]
+        result = home + [TextHit("战斗结算", .99, 731, 146, 111, 35),
+                         TextHit("【第1次快捷战斗结果】", .99, 722, 199, 207, 27),
+                         TextHit("确定", .99, 949, 748, 70, 42)]
+        flow = self.flow([self.dialog(1, 70, [hit("确定", 680, 560)]), result, result, home])
+        self.assertEqual(flow._execute_quick("使魔的爱", 1), 1)
+        self.assertEqual(flow._tap.call_args_list, [call(690, 570), call(984, 769)])
+
+        flow = self.flow([result[:3], result, result, home, home])
+        flow._screen = Mock(return_value=b"screen")
+        flow._dismiss_navigation_card = Mock(return_value=False)
+        with patch("hka.game_flows.find_image", return_value=(810, 85, 1.0)):
+            flow._home()
+        self.assertEqual(flow._tap.call_args_list, [call(984, 769, 1.0), call(800, 94, 2.5)])
+        for invalid in (result[:-1], result[:3] + result[4:], result + [hit("确定", 820, 760)]):
+            self.assertIsNone(flow._verified_combat_result_button(invalid))
 
 
 if __name__ == "__main__":

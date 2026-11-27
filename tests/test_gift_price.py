@@ -28,8 +28,14 @@ class GiftCancellationTests(unittest.TestCase):
     def test_unpriced_dialog_is_cancelled_and_verified(self):
         listing = [hit("吼美礼包", 30, 350), *self.card]
         flow = self.flow([self.dialog, self.dialog, listing])
-        with self.assertRaisesRegex(SkipTask, "已取消购买"):
+        flow.runner.last_decision_frame = b"unpriced-dialog"
+        def tap(x, y, wait=None):
+            if (x, y) == (946, 572):
+                flow.runner.last_decision_frame = b"listing"
+        flow._tap.side_effect = tap
+        with self.assertRaisesRegex(SkipTask, "已取消购买") as result:
             flow.free_gift({})
+        self.assertEqual(result.exception.decision_frame, b"unpriced-dialog")
         self.assertEqual(flow._tap.call_args_list, [call(665, 696), call(946, 572, 0.9)])
 
     def test_cancel_does_not_count_as_verified_if_dialog_stays_open(self):
