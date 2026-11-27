@@ -38,6 +38,22 @@ class GiftCancellationTests(unittest.TestCase):
         self.assertEqual(result.exception.decision_frame, b"unpriced-dialog")
         self.assertEqual(flow._tap.call_args_list, [call(665, 696), call(946, 572, 0.9)])
 
+    def test_dialog_without_inline_price_uses_current_zero_price_card(self):
+        confirmation = [*self.dialog, hit("×0", 662, 618), hit("购买", 631, 666)]
+        flow = self.flow([confirmation])
+        flow._text = Mock(return_value=hit("购买成功", 700, 300))
+        flow.free_gift({})
+        self.assertEqual(flow._tap.call_args_list,
+                         [call(665, 696), call(650, 570, 0.9), call(800, 555)])
+
+    def test_conflicting_dialog_price_rejects_verified_card_price(self):
+        confirmation = [*self.dialog, hit("消耗水晶 60", 700, 450),
+                        hit("×0", 662, 618), hit("购买", 631, 666)]
+        flow = self.flow([confirmation])
+        with self.assertRaisesRegex(RuntimeError, "最终价格"):
+            flow.free_gift({})
+        self.assertEqual(flow._tap.call_args_list, [call(665, 696)])
+
     def test_cancel_does_not_count_as_verified_if_dialog_stays_open(self):
         flow = self.flow([self.dialog] * 4)
         with self.assertRaisesRegex(RuntimeError, "取消后未确认"):
@@ -46,6 +62,6 @@ class GiftCancellationTests(unittest.TestCase):
 
     def test_missing_cancel_button_leaves_purchase_untouched(self):
         flow = self.flow([self.dialog[:-1]])
-        with self.assertRaisesRegex(RuntimeError, "最终价格"):
+        with self.assertRaisesRegex(RuntimeError, "提示和按钮"):
             flow.free_gift({})
         flow._tap.assert_called_once_with(665, 696)

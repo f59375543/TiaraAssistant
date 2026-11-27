@@ -10,37 +10,64 @@ def hit(text, x=700, y=400):
 
 
 class GiftConfirmationTests(unittest.TestCase):
-    def gift(self, confirmation):
+    def gift(self, confirmation, *, card_verified=False):
         flow = GameFlows(Mock())
         flow._shop = Mock()
         flow._click = Mock()
         flow._tap = Mock()
+        card = [hit("零时馈礼", 600, 300), hit("×0", 600, 480), hit("购买", 600, 540)]
+        card_evidence = ([hit("×0", 660, 620), hit("购买", 631, 666)]
+                         if card_verified else [])
+        confirmation_frame = [hit("零时馈礼"), *confirmation, *card_evidence]
         flow._hits = Mock(side_effect=[
-            [hit("零时馈礼", 600, 300), hit("×0", 600, 480), hit("购买", 600, 540)],
-            [hit("零时馈礼"), *confirmation],
+            card,
+            confirmation_frame,
+            confirmation_frame,
+            [hit("吼美礼包", 30, 350), *card],
         ])
         flow._text = Mock(return_value=hit("购买成功"))
         return flow
 
-    def test_rejects_unverified_and_conflicting_prices(self):
-        for labels in ([], ["非免费"], ["消耗水晶 60"], ["免费", "消耗水晶 60"],
+    def test_rejects_conflicting_prices(self):
+        for labels in (["非免费"], ["消耗水晶 60"], ["免费", "消耗水晶 60"],
                        ["免费次数已用完"], ["×0", "水晶", "60"]):
             with self.subTest(labels=labels):
-                flow = self.gift([*(hit(label) for label in labels), hit("购买", 720, 550)])
+                flow = self.gift([hit("是否购买零时馈礼", 700, 490),
+                                  *(hit(label) for label in labels),
+                                  hit("购买", 720, 550), hit("取消", 920, 550)])
                 with self.assertRaisesRegex(RuntimeError, "最终价格"):
                     flow.free_gift({})
                 flow._tap.assert_called_once_with(610, 550)
 
+    def test_unverified_dialog_is_cancelled(self):
+        flow = self.gift([hit("是否购买零时馈礼", 700, 490),
+                          hit("购买", 720, 550), hit("取消", 920, 550)])
+        with self.assertRaisesRegex(Exception, "已取消购买"):
+            flow.free_gift({})
+        self.assertEqual(flow._tap.call_args_list,
+                         [call(610, 550), call(930, 560, 0.9)])
+
     def test_rejects_ambiguous_buttons(self):
-        flow = self.gift([hit("免费"), hit("购买", 720, 550), hit("确认购买", 850, 550)])
+        flow = self.gift([hit("是否购买零时馈礼", 700, 490), hit("免费"),
+                          hit("购买", 720, 550), hit("确认购买", 850, 550),
+                          hit("取消", 920, 550)])
         with self.assertRaisesRegex(RuntimeError, "唯一"):
             flow.free_gift({})
         flow._tap.assert_called_once_with(610, 550)
 
+    def test_verified_card_price_without_dialog_price_completes(self):
+        flow = self.gift([hit("是否购买零时馈礼", 700, 490),
+                          hit("购买", 720, 550), hit("取消", 920, 550)],
+                         card_verified=True)
+        flow.free_gift({})
+        self.assertEqual(flow._tap.call_args_list,
+                         [call(610, 550), call(730, 560, 0.9), call(800, 555)])
+
     def test_verified_free_gift_completes(self):
         for price in ("免费", "消耗水晶 0", "×0"):
             with self.subTest(price=price):
-                flow = self.gift([hit(price), hit("购买", 720, 550)])
+                flow = self.gift([hit("是否购买零时馈礼", 700, 490), hit(price),
+                                  hit("购买", 720, 550), hit("取消", 920, 550)])
                 flow.free_gift({})
                 self.assertEqual(flow._tap.call_args_list,
                                  [call(610, 550), call(730, 560, 0.9), call(800, 555)])

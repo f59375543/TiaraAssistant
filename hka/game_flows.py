@@ -848,35 +848,49 @@ class GameFlows:
             raise SkipTask("零时馈礼价格不是 0，或已售完")
         self.log("已确认零时馈礼价格为 0")
         self._tap(buy.x + buy.width // 2, buy.y + buy.height // 2)
-        dialog = self._hits((500, 230, 1080, 630))
+        confirmation_hits = self._hits((230, 180, 1500, 820))
+        dialog = [hit for hit in confirmation_hits
+                  if 500 <= hit.x <= 1080 and 230 <= hit.y <= 630]
         if not find_text(dialog, "零时馈礼"):
             raise RuntimeError("购买确认框不是零时馈礼，未确认")
-        # The card and the confirmation can show different prices. Require
-        # an explicit free price on this frame and reject conflicting amounts.
+        # This confirmation dialog normally has no price row: the price stays
+        # on the card behind it. Re-read both together and only accept either
+        # an explicit zero in the dialog or an unchanged zero card price.
         words = [re.sub(r"\s+", "", hit.text) for hit in dialog]
         zero_price = re.compile(
             r"(?:免费|免费购买|[×xX*]0|(?:价格|售价|消耗|花费|总价)[:：]?(?:水晶|钻石)?[×xX*]?0(?:水晶|钻石)?"
             r"|(?:购买|确认购买)[（(]?[×xX*]0[）)]?)")
         price_clue = re.compile(r"\d|付费|收费|支付|充值|免费|价格|售价|总价|消耗|花费|水晶|钻石|人民币|元|[￥¥]")
         price_labels = [word for word in words if price_clue.search(word)]
-        if not price_labels and {"零时馈礼", "是否购买零时馈礼", "购买"} <= set(words):
-            cancel = [hit for hit, word in zip(dialog, words)
-                      if word == "取消" and 850 < hit.x < 1040 and 530 < hit.y < 610]
-            if len(cancel) == 1:
-                button = cancel[0]
-                price_dialog = self.runner.last_decision_frame
-                self._tap(button.x + button.width // 2, button.y + button.height // 2, 0.9)
-                for _ in range(3):
-                    shop = self._hits()
-                    item_visible = any(hit.text == "零时馈礼" and abs(hit.x - title.x) < 60
-                                       and abs(hit.y - title.y) < 60 for hit in shop)
-                    if (item_visible and find_text(shop, "吼美礼包")
-                            and not find_text(shop, "是否购买") and not find_text(shop, "取消")):
-                        raise SkipTask("零时馈礼确认框未读到最终价格，已取消购买", decision_frame=price_dialog)
-                    self.sleep(0.4)
-                raise RuntimeError("零时馈礼未提交购买，取消后未确认已返回商品列表")
-        if not price_labels or not all(zero_price.fullmatch(word) for word in price_labels):
+        cancel = [hit for hit, word in zip(dialog, words)
+                  if word == "取消" and 850 < hit.x < 1040 and 530 < hit.y < 610]
+        prompt_verified = ("是否购买零时馈礼" in words
+                           and "购买" in words and len(cancel) == 1)
+        if not prompt_verified:
+            raise RuntimeError("无法确认零时馈礼的提示和按钮，未提交购买")
+        if price_labels and not all(zero_price.fullmatch(word) for word in price_labels):
             raise RuntimeError("无法确认零时馈礼最终价格为零，未提交购买")
+        card_zero_price = any(
+            abs(hit.x - card_x) < 250 and 600 <= hit.y <= 740
+            and re.fullmatch(r"[×xX*]\s*0", hit.text.strip())
+            for hit in confirmation_hits)
+        card_buy = any(
+            abs(hit.x - card_x) < 250 and 620 <= hit.y <= 760
+            and hit.text.strip() == "购买" for hit in confirmation_hits)
+        if not price_labels and not (card_zero_price and card_buy):
+            button = cancel[0]
+            price_dialog = self.runner.last_decision_frame
+            self._tap(button.x + button.width // 2, button.y + button.height // 2, 0.9)
+            for _ in range(3):
+                shop = self._hits()
+                item_visible = any(hit.text == "零时馈礼" and abs(hit.x - title.x) < 60
+                                   and abs(hit.y - title.y) < 60 for hit in shop)
+                if (item_visible and find_text(shop, "吼美礼包")
+                        and not find_text(shop, "是否购买") and not find_text(shop, "取消")):
+                    raise SkipTask("零时馈礼确认框和卡片都没有读到免费价格，已取消购买",
+                                   decision_frame=price_dialog)
+                self.sleep(0.4)
+            raise RuntimeError("零时馈礼未提交购买，取消后未确认已返回商品列表")
         candidates = [hit for hit, word in zip(dialog, words) if hit.y > 490 and re.fullmatch(
             r"(?:购买|确认购买)(?:[（(]?[×xX*]0[）)]?)?|免费购买", word)]
         if len(candidates) != 1:
