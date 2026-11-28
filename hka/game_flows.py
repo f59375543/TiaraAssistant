@@ -190,7 +190,35 @@ class GameFlows:
             self.sleep(0.5)
         raise NavigationError("关闭活动时间提示后未能确认返回关卡列表")
 
+    @staticmethod
+    def _expiring_token_title_visible(hits: list[TextHit]) -> bool:
+        title = re.sub(r"\s+", "", "".join(
+            h.text for h in hits if 420 <= h.x <= 1180 and 170 <= h.y <= 340
+        ))
+        return all(token in title for token in ("活动代币", "销毁", "尽快使用"))
+
+    def _dismiss_expiring_tokens(self, hits: list[TextHit]) -> bool:
+        if not self._expiring_token_title_visible(hits):
+            return False
+        buttons = [h for h in hits if 650 <= h.x <= 950 and 540 <= h.y <= 700
+                   and re.sub(r"\s+", "", h.text) == "确认"]
+        cancels = [h for h in hits if 650 <= h.x <= 950 and 540 <= h.y <= 700
+                   and re.sub(r"\s+", "", h.text) == "取消"]
+        if len(buttons) != 1 or cancels:
+            raise NavigationError("检测到活动代币即将销毁提示，但确认按钮未唯一识别，已停止导航")
+        button = buttons[0]
+        self.log("检测到活动代币即将销毁提示，点击确认关闭")
+        self._tap(button.x + button.width // 2, button.y + button.height // 2, 1.0)
+        for _ in range(4):
+            if not self._expiring_token_title_visible(self._hits()):
+                self.log("已确认活动代币销毁提示关闭")
+                return True
+            self.sleep(0.5)
+        raise NavigationError("点击确认后活动代币销毁提示仍未关闭，已停止导航")
+
     def _dismiss_navigation_notice(self, hits: list[TextHit]) -> bool:
+        if self._dismiss_expiring_tokens(hits):
+            return True
         close = self._reward_receipt_close_point(hits)
         if close is not None:
             if self._navigation_receipt_open:
